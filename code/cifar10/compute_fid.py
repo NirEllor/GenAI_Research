@@ -1,0 +1,263 @@
+# Code modified from https://github.com/atong01/conditional-flow-matching/tree/main.
+
+# Authors: Anirban Samaddar
+
+
+import os
+import sys
+sys.path.append('/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/conditional-flow-matching/examples/images/cifar10/')
+
+import matplotlib.pyplot as plt
+import torch
+from absl import app, flags
+from cleanfid import fid
+from torchdiffeq import odeint
+from torchdyn.core import NeuralODE
+
+sys.path.append('/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/conditional-flow-matching/torchcfm/models/unet/')
+from unet_resnetVAE import UNetModelWrapper
+from KNIFE_Org_func import sample, base_mean_sampler, base_sampler_w_center,base_sampler
+from pathlib import Path
+import argparse
+from pl_bolts.models.autoencoders import VAE
+from pl_bolts.datamodules import CIFAR10DataModule
+from utils_cifar import infiniteloop
+from torchvision import datasets, transforms
+from torchvision.utils import make_grid, save_image
+sys.path.append('/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/NVAE')
+from model import AutoEncoder
+import utils
+import numpy as np
+
+FLAGS = flags.FLAGS
+# UNet
+flags.DEFINE_integer("num_channel", 128, help="base channel of UNet")
+
+# Training
+flags.DEFINE_string("input_dir", "./results", help="output_directory")
+flags.DEFINE_string("model", "otcfm", help="flow matching model type")
+flags.DEFINE_integer("integration_steps", 100, help="number of inference steps")
+flags.DEFINE_string("integration_method", "dopri5", help="integration method to use")
+flags.DEFINE_integer("step", 400000, help="training steps")
+flags.DEFINE_integer("num_gen", 50000, help="number of samples to generate")
+flags.DEFINE_float("tol", 1e-5, help="Integrator tolerance (absolute and relative)")
+flags.DEFINE_integer("batch_size_fid", 1024, help="Batch size to compute FID")
+flags.DEFINE_string("base_dist", "normal", help="Base distribution for sampling")
+flags.DEFINE_bool('ema',True, help='Use EMA model')
+flags.DEFINE_integer("class_cond", 0, help="Residual type - 0: no class, 1: dispatcher, 2: clust_id")
+
+FLAGS(sys.argv)
+
+
+# Define the model
+use_cuda = torch.cuda.is_available()
+device = torch.device("cuda:0" if use_cuda else "cpu")
+
+
+class torch_wrapper(torch.nn.Module):
+    """Wraps model to torchdyn compatible format."""
+
+    def __init__(self, model, y=None):
+        super().__init__()
+        self.model = model
+        if y is not None:
+            self.y = y
+
+    def forward(self, t, x, *args, **kwargs):
+        output = self.model(t,x,y=self.y) if hasattr(self, 'y') else self.model(t,x)
+        return output[0] if isinstance(output, tuple) else output
+
+
+# DATASETS/DATALOADER
+dataset = datasets.CIFAR10(
+        root="/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/data",
+        train=True,
+        download=True,
+        transform=transforms.Compose(
+            [
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ]
+        ),
+    )
+
+dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=FLAGS.batch_size_fid,
+        shuffle=True,
+        num_workers=12,
+        drop_last=True,
+    )
+
+datalooper = infiniteloop(dataloader)
+
+if FLAGS.class_cond == 1 or FLAGS.class_cond == 0:
+    new_net = UNetModelWrapper(
+        dim=(3, 32, 32),
+        num_res_blocks=2,
+        num_channels=FLAGS.num_channel,
+        channel_mult=[1, 2, 2, 2],
+        num_heads=4,
+        num_head_channels=64,
+        attention_resolutions="16",
+        dropout=0.1,
+        num_classes=None,
+        num_latents=512 if FLAGS.class_cond == 1 else None,
+        class_cond= False,
+    ).to(device)
+elif FLAGS.class_cond == 2:
+    from unet import UNetModelWrapper
+    new_net = UNetModelWrapper(
+        dim=(3, 32, 32),
+        num_res_blocks=2,
+        num_channels=FLAGS.num_channel,
+        channel_mult=[1, 2, 2, 2],
+        num_heads=4,
+        num_head_channels=64,
+        attention_resolutions="16",
+        dropout=0.1,
+        num_classes=None,
+        num_latents=512,
+        class_cond= False,
+    ).to(device)
+    
+
+vae = VAE(32, lr=0.00001)
+vae = vae.from_pretrained("cifar10-resnet18").to(device)
+vae.eval()
+dm = CIFAR10DataModule("/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/data/", normalize=True)
+mean = torch.tensor(dm.default_transforms().transforms[1].mean).to(device)[None,:,None,None]
+std = torch.tensor(dm.default_transforms().transforms[1].std).to(device)[None,:,None,None]
+
+
+
+# Load the model
+if FLAGS.class_cond == 0:
+    PATH = f"{FLAGS.input_dir}/{FLAGS.model}/{FLAGS.model}_cifar10_weights_step_{FLAGS.step}.pt" 
+elif FLAGS.class_cond == 1:
+    PATH = f"{FLAGS.input_dir}/{FLAGS.model}/{FLAGS.model}_cifar10_{FLAGS.base_dist}_weights_step_{FLAGS.step}_vae_cond_kl.pt"
+elif FLAGS.class_cond == 2:
+    PATH = f"{FLAGS.input_dir}/{FLAGS.model}/icfm_cifar10_kde_weights_step_{FLAGS.step}_vrfm_x1.pt"
+
+print("path: ", PATH)
+checkpoint = torch.load(PATH, map_location=device)
+state_dict = checkpoint["ema_model"] if FLAGS.ema else checkpoint["net_model"]
+try:
+    new_net.load_state_dict(state_dict)
+except RuntimeError:
+    from collections import OrderedDict
+
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        new_state_dict[k[7:]] = v
+    new_net.load_state_dict(new_state_dict)
+new_net.eval()
+new_net.training = False
+# print(new_net,flush=True)
+
+
+
+def gen_1_img(unused_latent):
+    with torch.no_grad():
+        if FLAGS.class_cond == 0:
+            x = torch.randn(FLAGS.batch_size_fid, 3, 32, 32, device=device) if FLAGS.base_dist == 'normal' else sample((FLAGS.batch_size_fid,), params).to(device).view(-1, 3, 32, 32)
+        elif FLAGS.class_cond == 1:
+            x1 = next(datalooper).to(device)
+            renormalized_input = x1*0.5 + 0.5
+            renormalized_input = (renormalized_input - mean) / std
+            output_img = vae(renormalized_input)
+            unnormalize = transforms.Normalize((-mean / std).tolist(), (1.0 / std).tolist())
+            output_img = unnormalize(renormalized_input)
+            latent = vae.encoder(renormalized_input).view(FLAGS.batch_size_fid, -1)
+
+            output_tiled = utils.tile_image(output_img[:100,], 10).cpu().numpy().transpose(1, 2, 0)
+            output_tiled = np.asarray(output_tiled * 255, dtype=np.uint8)
+            output_tiled = np.squeeze(output_tiled)
+
+
+            latent = new_net.latent_encodings(latent)
+            mu,logvar = torch.chunk(latent, 2, dim=1)
+            latent = mu + torch.randn_like(mu) * torch.exp(0.5*logvar) #torch.randn(FLAGS.batch_size_fid,256, device=device) #mu + torch.randn_like(mu) * torch.exp(0.5*logvar)    # Fixing the random latent conditioning for each trajectory
+            
+            # latent = torch.randn(FLAGS.batch_size_fid, 256, device=device)
+            x = torch.randn(FLAGS.batch_size_fid, 3, 32, 32, device=device)
+        elif FLAGS.class_cond == 2:
+            latent = torch.randn(FLAGS.batch_size_fid,512, device=device) #mu + torch.randn_like(mu) * torch.exp(0.5*logvar)    # Fixing the random latent conditioning for each trajectory
+            
+            # latent = torch.randn(FLAGS.batch_size_fid, 256, device=device)
+            x = torch.randn(FLAGS.batch_size_fid, 3, 32, 32, device=device)
+
+
+        if FLAGS.integration_method == "euler":
+            # Define the integration method if euler is used
+            if FLAGS.class_cond == 1 or FLAGS.class_cond == 2:
+                node = NeuralODE(torch_wrapper(new_net,y=latent), solver=FLAGS.integration_method)
+                # node = NeuralODE(lambda t,x: torch_wrapper(new_net,y=latent)(t,x), solver=FLAGS.integration_method)
+                name = "KDE_clust_sample_cifar_ic_ema_FID_600K_euler"
+            else:
+                node = NeuralODE(new_net, solver=FLAGS.integration_method)
+                name = "Gaussian_cifar_ic_ema_FID_600K_euler"
+            print("Use method: ", FLAGS.integration_method)
+            t_span = torch.linspace(0, 1, FLAGS.integration_steps + 1, device=device)
+            traj = node.trajectory(x, t_span=t_span)
+            # torch.save(traj, f"{FLAGS.input_dir}/{FLAGS.model}/{name}.pt")
+        else:
+            print("Use method: ", FLAGS.integration_method)
+            t_span = torch.linspace(0, 1, 2, device=device)
+            if FLAGS.class_cond == 1 or FLAGS.class_cond == 2:
+                traj = odeint(
+                    torch_wrapper(new_net,latent), x, t_span, rtol=FLAGS.tol, atol=FLAGS.tol, method=FLAGS.integration_method
+                )
+            else:
+                traj = odeint(new_net, x, t_span, rtol=FLAGS.tol, atol=FLAGS.tol, method=FLAGS.integration_method)
+    traj = traj[-1, :]
+    img = (traj * 127.5 + 128).clip(0, 255).to(torch.uint8)  # .permute(1, 2, 0)
+
+    traj = traj[:100,].view([-1, 3, 32, 32]).clip(-1, 1)
+    traj = traj / 2 + 0.5
+    if FLAGS.class_cond == 1:
+        save_image(traj, f"{FLAGS.input_dir}/{FLAGS.model}/Generated_images_{FLAGS.model}_cifar10_{FLAGS.base_dist}_weights_step_{FLAGS.step}_vae_cond_rep2.png", nrow=10)
+    elif FLAGS.class_cond == 2:
+        save_image(traj, f"{FLAGS.input_dir}/{FLAGS.model}/Generated_images_{FLAGS.model}_cifar10_{FLAGS.base_dist}_weights_step_{FLAGS.step}_vrfm_x1.png", nrow=10)
+
+    if FLAGS.class_cond == 1:
+            plt.imshow(output_tiled)
+            plt.savefig(f"{FLAGS.input_dir}/{FLAGS.model}/Original_images_{FLAGS.model}_cifar10_{FLAGS.base_dist}_weights_step_{FLAGS.step}_vae_cond.png")
+            plt.close()
+    return img
+
+
+print("Start computing FID")
+score = fid.compute_fid(
+    gen=gen_1_img,
+    dataset_name="cifar10",
+    batch_size=FLAGS.batch_size_fid,
+    dataset_res=32,
+    num_gen=FLAGS.num_gen,
+    dataset_split="train",
+    mode="legacy_tensorflow",
+)
+print()
+print("FID has been computed")
+print()
+# print("Total NFE: ", new_net.nfe)
+# print()
+print("FID: ", score)
+
+
+'''
+nohup python3 compute_fid.py --integration_method 'euler' --class_cond 1 --model "icfm" --step 600000 --base_dist kde --input_dir /lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/conditional-flow-matching/examples/images/cifar10/runs/ &> /lcrc/project/FastBayes/Anirban_VI/Diffusion_models/logs/KDE_vae_cifar_ic_ema_FID_600K_euler_kl.log &
+nohup python3 compute_fid.py --integration_method 'euler' --integration_steps 1000 --class_cond 1 --model "icfm" --step 600000 --base_dist kde --input_dir /lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/conditional-flow-matching/examples/images/cifar10/runs/ &> /lcrc/project/FastBayes/Anirban_VI/Diffusion_models/logs/KDE_vae_cifar_ic_ema_FID_600K_euler_kl_1000.log &
+
+
+nohup python3 compute_fid.py --integration_method 'dopri5' --class_cond 1 --model "icfm" --step 200000 --base_dist kde --input_dir /lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/conditional-flow-matching/examples/images/cifar10/runs/ &> /lcrc/project/FastBayes/Anirban_VI/Diffusion_models/logs/KDE_vae_cifar_ic_ema_FID_200K_dopri5_kl_trainset.log &
+nohup python3 compute_fid.py --integration_method 'dopri5' --class_cond 1 --model "icfm" --step 400000 --base_dist kde --input_dir /lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/conditional-flow-matching/examples/images/cifar10/runs/ &> /lcrc/project/FastBayes/Anirban_VI/Diffusion_models/logs/KDE_vae_cifar_ic_ema_FID_400K_dopri5_kl_trainset.log &
+nohup python3 compute_fid.py --integration_method 'dopri5' --class_cond 1 --model "icfm" --step 600000 --base_dist kde --input_dir /lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/conditional-flow-matching/examples/images/cifar10/runs/ &> /lcrc/project/FastBayes/Anirban_VI/Diffusion_models/logs/KDE_vae_cifar_ic_ema_FID_600K_dopri5_kl_trainset.log &
+nohup python3 compute_fid.py --integration_method 'dopri5' --class_cond 1 --model "icfm" --step 600000 --base_dist kde --input_dir /lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/conditional-flow-matching/examples/images/cifar10/runs/ &> /lcrc/project/FastBayes/Anirban_VI/Diffusion_models/logs/KDE_vae_cifar_ic_ema_FID_600K_dopri5_kl_prior.log &
+
+nohup python3 compute_fid.py --integration_method 'dopri5' --class_cond 2 --model "icfm" --step 300000 --base_dist kde --input_dir /lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/conditional-flow-matching/examples/images/cifar10/runs/ &> /lcrc/project/FastBayes/Anirban_VI/Diffusion_models/logs/VRFM_cifar_ic_ema_FID_300K_dopri5_x1.log &
+nohup python3 compute_fid.py --integration_method 'dopri5' --class_cond 2 --model "icfm" --step 600000 --base_dist kde --input_dir /lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/conditional-flow-matching/examples/images/cifar10/runs/ &> /lcrc/project/FastBayes/Anirban_VI/Diffusion_models/logs/VRFM_cifar_ic_ema_FID_600K_dopri5_x1.log &
+
+
+'''
