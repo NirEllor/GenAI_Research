@@ -2,9 +2,11 @@
 
 # Authors: Anirban Samaddar
 
+# This file is for Latent CFM with 2d latent space.
+
 """From https://raw.githubusercontent.com/openai/guided-diffusion/main/guided_diffusion/unet.py."""
 import sys
-sys.path.append('/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/conditional-flow-matching/torchcfm/models/unet/')
+sys.path.append('./code/torchcfm/models/unet/')
 
 import math
 from abc import abstractmethod

@@ -231,7 +231,7 @@ def train(rank, total_num_gpus, argv):
                                 "optim": optim.state_dict(),
                                 "step": global_step,
                             },
-                            savedir + f"{FLAGS.model}_cifar10_weights_step_{global_step}.pt",
+                            savedir + f"Cifar10_weights_step_{global_step}.pt",
                         )
 
 

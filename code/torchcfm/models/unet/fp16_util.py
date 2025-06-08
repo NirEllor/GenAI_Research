@@ -1,6 +1,6 @@
 """Helpers to train with 16-bit precision."""
 import sys
-sys.path.append('/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/conditional-flow-matching/torchcfm/models/unet/')
+sys.path.append('./code/torchcfm/models/unet/')
 
 import numpy as np
 import torch as th

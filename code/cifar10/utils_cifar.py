@@ -10,10 +10,17 @@ from torchdyn.core import NeuralODE
 
 # from torchvision.transforms import ToPILImage
 from torchvision.utils import make_grid, save_image
-from KNIFE_Org_func import sample, base_mean_sampler
 
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
+
+def tile_image(batch_image, n):
+    assert n * n == batch_image.size(0)
+    channels, height, width = batch_image.size(1), batch_image.size(2), batch_image.size(3)
+    batch_image = batch_image.view(n, n, channels, height, width)
+    batch_image = batch_image.permute(2, 0, 3, 1, 4)                              # n, height, n, width, c
+    batch_image = batch_image.contiguous().view(channels, n * height, n * width)
+    return batch_image
 
 
 def setup(

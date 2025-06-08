@@ -3,7 +3,7 @@
 # Authors: Anirban Samaddar
 
 import sys
-sys.path.append('/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/conditional-flow-matching/examples/images/cifar10/')
+sys.path.append('./code/cifar10/')
 
 import copy
 import math
@@ -24,12 +24,11 @@ from torchcfm.conditional_flow_matching import (
     TargetConditionalFlowMatcher,
     VariancePreservingConditionalFlowMatcher,
 )
-sys.path.append('/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/conditional-flow-matching/torchcfm/models/unet/')
+sys.path.append('./code/torchcfm/models/unet/')
 from unet_resnetVAE import UNetModelWrapper
 from torchvision.utils import make_grid
 from torchvision.transforms import ToPILImage
 import matplotlib.pyplot as plt
-from KNIFE_Org_func import sample, base_sampler
 from pathlib import Path
 import argparse
 from types import SimpleNamespace
@@ -342,7 +341,7 @@ def train(rank, total_num_gpus, argv):
                                 "optim": optim.state_dict(),
                                 "step": global_step,
                             },
-                            savedir + f"{FLAGS.model}_cifar10_kde_weights_step_{global_step}_vae_cond_kl_rep2.pt",
+                            savedir + f"Cifar10_weights_step_{global_step}_Lcfm.pt",
                         )
 
 
