@@ -1,4 +1,4 @@
-# Latent_CFM
+# Latent CFM
 This repository contains the codebase of the paper "Efficient Flow Matching using Latent Variables" ([https://arxiv.org/abs/2505.04486](https://arxiv.org/abs/2505.04486)).
 
 **Abstarct**
@@ -11,3 +11,15 @@ Flow matching models have shown great potential in image generation tasks among 
 **Figure:** Schematic of Latent-CFM framework. Given a data x1, 𝙻𝚊𝚝𝚎𝚗𝚝-𝙲𝙵𝙼 extracts latent features using a frozen encoder and a trainable stochastic layer. The features are embedded using
 a linear layer and added to the learned vector field. The framework resembles an encoder-decoder architecture like VAEs.
 
+**Usage**
+To train 𝙻𝚊𝚝𝚎𝚗𝚝-𝙲𝙵𝙼 on CIFAR10 using DDP with 2 GPUs, use the following code:
+```
+MASTER_ADDR=$(hostname)  # Using the current node as the master address
+MASTER_PORT=12357        # Fixed port; ensure it's free on the system
+torchrun --standalone --nnodes=1 --nproc_per_node=2 ./code/cifar10/train_cifar10_ddp_vae_cond_ic.py   --model "icfm"   --output_dir "./code/cifar10/runs/"   --lr 2e-4   --ema_decay 0.9999   --batch_size 128   --num_workers 4   --total_steps 600001   --save_step 100000   --parallel True   --master_addr $MASTER_ADDR  --master_port $MASTER_PORT
+```
+To compute the FID from the saved model, use the following code:
+```
+nohup python3 ./code/cifar10/compute_fid.py --integration_method 'euler' --integration_steps 100 --class_cond 1 --model "icfm" --step 600000 --input_dir ./code/cifar10/runs/ &> ./logs/FID_cifar_ema_600K_Lcfm_euler_100.log &
+```
+Change the ```integration_method``` and ```integration_steps``` accordingly to explore other solvers such as the ```dopri5```. 
