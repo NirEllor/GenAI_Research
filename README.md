@@ -20,6 +20,6 @@ torchrun --standalone --nnodes=1 --nproc_per_node=2 ./code/cifar10/train_cifar10
 ```
 To compute the FID from the saved model, use the following code:
 ```
-nohup python3 ./code/cifar10/compute_fid.py --integration_method 'euler' --integration_steps 100 --class_cond 1 --model "icfm" --step 600000 --input_dir ./code/cifar10/runs/ &> ./logs/FID_cifar_ema_600K_Lcfm_euler_100.log &
+python3 ./code/cifar10/compute_fid.py --integration_method 'euler' --integration_steps 100 --class_cond 1 --model "icfm" --step 600000 --input_dir ./code/cifar10/runs/
 ```
 Change the ```integration_method``` and ```integration_steps``` accordingly to explore other solvers such as the ```dopri5```. 
