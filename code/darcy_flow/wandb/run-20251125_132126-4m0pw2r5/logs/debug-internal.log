@@ -1,0 +1,15 @@
+{"time":"2025-11-25T13:21:27.395008837-06:00","level":"INFO","msg":"stream: starting","core version":"0.19.6","symlink path":"/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/Latent_CFM/code/darcy_flow/wandb/run-20251125_132126-4m0pw2r5/logs/debug-core.log"}
+{"time":"2025-11-25T13:21:27.512180938-06:00","level":"INFO","msg":"created new stream","id":"4m0pw2r5"}
+{"time":"2025-11-25T13:21:27.512269646-06:00","level":"INFO","msg":"stream: started","id":"4m0pw2r5"}
+{"time":"2025-11-25T13:21:27.512304152-06:00","level":"INFO","msg":"writer: Do: started","stream_id":"4m0pw2r5"}
+{"time":"2025-11-25T13:21:27.512332225-06:00","level":"INFO","msg":"handler: started","stream_id":"4m0pw2r5"}
+{"time":"2025-11-25T13:21:27.512318419-06:00","level":"INFO","msg":"sender: started","stream_id":"4m0pw2r5"}
+{"time":"2025-11-25T13:21:27.873032274-06:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2025-11-25T13:21:40.993117509-06:00","level":"INFO","msg":"stream: closing","id":"4m0pw2r5"}
+{"time":"2025-11-25T13:21:40.993192801-06:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2025-11-25T13:21:40.99415925-06:00","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2025-11-25T13:21:41.406033797-06:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-11-25T13:21:41.617888926-06:00","level":"INFO","msg":"handler: closed","stream_id":"4m0pw2r5"}
+{"time":"2025-11-25T13:21:41.617937939-06:00","level":"INFO","msg":"writer: Close: closed","stream_id":"4m0pw2r5"}
+{"time":"2025-11-25T13:21:41.61795972-06:00","level":"INFO","msg":"sender: closed","stream_id":"4m0pw2r5"}
+{"time":"2025-11-25T13:21:41.61829801-06:00","level":"INFO","msg":"stream: closed","id":"4m0pw2r5"}
