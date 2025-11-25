@@ -1,0 +1,84 @@
+{
+  "os":  "Linux-5.15.0-78-generic-x86_64-with-glibc2.10",
+  "python":  "CPython 3.8.5",
+  "startedAt":  "2025-11-25T19:25:20.586089Z",
+  "args":  [
+    "--model",
+    "icfm",
+    "--output_dir",
+    "/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/Latent_CFM/code/darcy_flow/runs/",
+    "--lr",
+    "2e-4",
+    "--ema_decay",
+    "0.9999",
+    "--batch_size",
+    "128",
+    "--num_workers",
+    "4",
+    "--total_steps",
+    "100001",
+    "--save_step",
+    "10000",
+    "--parallel",
+    "True",
+    "--master_addr",
+    "gpu1",
+    "--master_port",
+    "12347"
+  ],
+  "program":  "vae_cifar10_ddp_medium.py",
+  "codePath":  "code/darcy_flow/vae_cifar10_ddp_medium.py",
+  "git":  {
+    "remote":  "https://github.com/AnirbanSamaddar/Latent_CFM.git",
+    "commit":  "ea6acd70fe4c28b95486798b53c46462e9fdd2f7"
+  },
+  "email":  "anirbansamaddar00@gmail.com",
+  "root":  "/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/Latent_CFM/code/darcy_flow",
+  "host":  "gpu1",
+  "executable":  "/lcrc/project/FastBayes/Anirban_VI/PyTorchTF-GPU_AB/bin/python3.8",
+  "codePathLocal":  "vae_cifar10_ddp_medium.py",
+  "cpu_count":  128,
+  "cpu_count_logical":  256,
+  "gpu":  "NVIDIA A100-SXM4-40GB",
+  "gpu_count":  4,
+  "disk":  {
+    "/":  {
+      "total":  "1888426192896",
+      "used":  "94287790080"
+    }
+  },
+  "memory":  {
+    "total":  "1081953009664"
+  },
+  "cpu":  {
+    "count":  128,
+    "countLogical":  256
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA A100-SXM4-40GB",
+      "memoryTotal":  "42949672960",
+      "cudaCores":  6912,
+      "architecture":  "Ampere"
+    },
+    {
+      "name":  "NVIDIA A100-SXM4-40GB",
+      "memoryTotal":  "42949672960",
+      "cudaCores":  6912,
+      "architecture":  "Ampere"
+    },
+    {
+      "name":  "NVIDIA A100-SXM4-40GB",
+      "memoryTotal":  "42949672960",
+      "cudaCores":  6912,
+      "architecture":  "Ampere"
+    },
+    {
+      "name":  "NVIDIA A100-SXM4-40GB",
+      "memoryTotal":  "42949672960",
+      "cudaCores":  6912,
+      "architecture":  "Ampere"
+    }
+  ],
+  "cudaVersion":  "12.2"
+}
