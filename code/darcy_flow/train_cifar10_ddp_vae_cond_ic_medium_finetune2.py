@@ -4,7 +4,7 @@
 #          Alexander Tong
 #          Imahn Shekhzadeh
 import sys
-sys.path.append('/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/conditional-flow-matching/examples/images/darcy_flow/')
+sys.path.append('./code/darcy_flow/')
 
 import copy
 import math
@@ -25,9 +25,9 @@ from torchcfm.conditional_flow_matching import (
     TargetConditionalFlowMatcher,
     VariancePreservingConditionalFlowMatcher,
 )
-sys.path.append('/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/conditional-flow-matching/torchcfm/models/unet/')
-from unet_resnetVAE2 import UNetModelWrapper, EncoderVAE
-sys.path.append('/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/StableDiffusion-PyTorch/models/')
+sys.path.append('./code/torchcfm/models/unet/')
+from unet_resnetVAE import UNetModelWrapper, EncoderVAE
+sys.path.append('./code/torchcfm/models/StableDiffusion-PyTorch/')
 from vae import VAE
 from torchvision.utils import make_grid
 from torchvision.transforms import ToPILImage
@@ -37,8 +37,6 @@ import argparse
 from types import SimpleNamespace
 from torchvision.utils import make_grid, save_image
 import wandb
-wandb.init(project="flow_matching")
-from wandb import log
 os.environ["NUMEXPR_MAX_THREADS"] = "8"
 torch.set_num_threads(4)
 
@@ -52,6 +50,7 @@ flags.DEFINE_string("model", "otcfm", help="flow matching model type")
 flags.DEFINE_string("output_dir", "./results/", help="output_directory")
 # UNet
 flags.DEFINE_integer("num_channel", 128, help="base channel of UNet")
+flags.DEFINE_integer("latent_dim", 256, help="dimension of the latent space")
 
 # Training
 flags.DEFINE_float("lr", 2e-4, help="target learning rate")  # TRY 2e-4
@@ -141,26 +140,8 @@ def generate_sample_trajectories(model, parallel, savedir, step, net_="normal",t
         traj = traj[:,traj_id].view([-1, 2,64,64])
         # traj = traj / 2 + 0.5
     
-    plot_darcy(traj[:,0].cpu().numpy(), savedir + f"{net_}_generated_KDE_FM_images_step_{step}_vae_cond_kl_medium_P_finetune2.png")
-    plot_darcy(traj[:,1].cpu().numpy(), savedir + f"{net_}_generated_KDE_FM_images_step_{step}_vae_cond_kl_medium_K_finetune2.png")
-    # colormap = "jet"
-    # plt.imshow(traj[9,0].cpu().numpy(), cmap=colormap)
-    # plt.colorbar()
-    # plt.savefig(savedir + f"{net_}_generated_KDE_FM_images_step_{step}_vae_cond_kl_P_s100.png")
-    # plt.close()
-    # plt.imshow(traj[3,0].cpu().numpy(), cmap=colormap)
-    # plt.colorbar()
-    # plt.savefig(savedir + f"{net_}_generated_KDE_FM_images_step_{step}_vae_cond_kl_P_s30.png")
-    # plt.close()
-
-    # plt.imshow(traj[9,1].cpu().numpy(), cmap=colormap)
-    # plt.colorbar()
-    # plt.savefig(savedir + f"{net_}_generated_KDE_FM_images_step_{step}_vae_cond_kl_K_s100.png")
-    # plt.close()
-    # plt.imshow(traj[3,1].cpu().numpy(), cmap=colormap)
-    # plt.colorbar()
-    # plt.savefig(savedir + f"{net_}_generated_KDE_FM_images_step_{step}_vae_cond_kl_K_s30.png")
-    # plt.close()
+    plot_darcy(traj[:,0].cpu().numpy(), savedir + f"{net_}_generated_KDE_FM_images_step_{step}_LCFM_P_finetune.png")
+    plot_darcy(traj[:,1].cpu().numpy(), savedir + f"{net_}_generated_KDE_FM_images_step_{step}_LCFM_K_finetune.png")
 
     model.train()
 
@@ -169,6 +150,9 @@ def kl_loss(mu, logvar):
 
 
 def train(rank, total_num_gpus, argv):
+    if rank == 0:
+        wandb.init(project="flow_matching", entity = "anirbansamaddar00-argonne-national-laboratory")
+
     print(
         "lr, total_steps, ema decay, save_step:",
         FLAGS.lr,
@@ -187,7 +171,7 @@ def train(rank, total_num_gpus, argv):
         batch_size_per_gpu = FLAGS.batch_size
 
     # DATASETS/DATALOADER
-    dataset = Darcy_Dataset(path="/lcrc/project/FastBayes/Yixuan/Darcy_n16/")
+    dataset = Darcy_Dataset(path="./Darcy_n16/")
     print("Check 2")
     sampler = DistributedSampler(dataset) if FLAGS.parallel else None
     dataloader = torch.utils.data.DataLoader(
@@ -223,7 +207,7 @@ def train(rank, total_num_gpus, argv):
     model_config['norm_channels'] = 8
     model_config['num_heads'] = 4 # Doesn't matter
     vae = VAE(im_channels=2,model_config=model_config).to(rank)
-    vae_checkpoint = torch.load(FLAGS.output_dir+'icfm/icfm_cifar10_kde_weights_step_100000_base_vae_medium.pt', map_location=f"cuda:{rank}") if FLAGS.parallel else torch.load(FLAGS.output_dir+'icfm/icfm_cifar10_kde_weights_step_100000_base_vae_medium.pt', map_location=rank)
+    vae_checkpoint = torch.load('./code/darcy_flow/runs/icfm/icfm_cifar10_kde_weights_step_100000_base_vae_medium_pdeLoss.pt', map_location=f"cuda:{rank}") if FLAGS.parallel else torch.load('./code/darcy_flow/runs/icfm/icfm_cifar10_kde_weights_step_100000_base_vae_medium_pdeLoss.pt', map_location=rank)
     try:
             vae.load_state_dict(vae_checkpoint["vae"])
     except RuntimeError:
@@ -243,6 +227,7 @@ def train(rank, total_num_gpus, argv):
         attention_resolutions="16",
         dropout=0.1,
         num_latents=8*8*8,
+        latent_dim=FLAGS.latent_dim,
     ).to(
         rank
     )  # new dropout + bs of 128
@@ -253,7 +238,7 @@ def train(rank, total_num_gpus, argv):
     print("Check 6")
 
     ema_model = copy.deepcopy(net_model)
-    optim = torch.optim.Adam(list(net_model.parameters()) + list(vae.parameters()), lr=FLAGS.lr)
+    optim = torch.optim.Adam(net_model.parameters(), lr=FLAGS.lr)
     sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
 
     if FLAGS.restart_dir is not None:
@@ -289,11 +274,11 @@ def train(rank, total_num_gpus, argv):
     model_size = 0
     for param in net_model.parameters():
         model_size += param.data.nelement()
-    print("Model params: %.2f M" % (model_size / 1024 / 1024))
+    print("Model params: %.2f M" % (model_size / 1e6))
     vae_size = 0
     for param in vae.parameters():
         vae_size += param.data.nelement()
-    print("VAE params: %.2f M" % (vae_size / 1024 / 1024))
+    print("VAE params: %.2f M" % (vae_size / 1e6))
 
     #################################
     #            OT-CFM
@@ -346,17 +331,18 @@ def train(rank, total_num_gpus, argv):
                     loss = mse_loss + 0.001 * kl
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(net_model.parameters(), FLAGS.grad_clip)  # new
-                    torch.nn.utils.clip_grad_norm_(vae.parameters(), FLAGS.grad_clip)  # new
+                    # torch.nn.utils.clip_grad_norm_(vae.parameters(), FLAGS.grad_clip)  # new
                     optim.step()
                     sched.step()
                     ema(net_model, ema_model, FLAGS.ema_decay)  # new
 
-                    wandb.log({
-                    "loss/total": loss.item(),
-                    "loss/mse": mse_loss.item(),
-                    "loss/kl": kl.item(),
-                    "global_step": global_step
-                    })
+                    if rank == 0:
+                        wandb.log({
+                        "loss/total": loss.item(),
+                        "loss/mse": mse_loss.item(),
+                        "loss/kl": kl.item(),
+                        "global_step": global_step
+                        })
 
 
                     # sample and Saving the weights
@@ -376,7 +362,7 @@ def train(rank, total_num_gpus, argv):
                                 "optim": optim.state_dict(),
                                 "step": global_step,
                             },
-                            savedir + f"{FLAGS.model}_cifar10_kde_weights_step_{global_step}_vae_cond_kl_medium_finetune2.pt",
+                            savedir + f"{FLAGS.model}_cifar10_kde_weights_step_{global_step}_LCFM_finetune.pt",
                         )
 
 
@@ -395,3 +381,21 @@ def main(argv):
 
 if __name__ == "__main__":
     app.run(main)
+
+
+'''
+torchrun --standalone --nnodes=1 --nproc_per_node=$NUM_GPUS train_cifar10_ddp_vae_cond_ic_medium_finetune2.py \
+  --model "icfm" \
+  --output_dir "./code/darcy_flow/runs/" \
+  --lr 2e-4 \
+  --ema_decay 0.9999 \
+  --batch_size 128 \
+  --num_workers 4 \
+  --total_steps 100001 \
+  --save_step 10000 \
+  --parallel True \
+  --master_addr $MASTER_ADDR \
+  --master_port $MASTER_PORT \
+  --latent_dim 2 \
+
+'''

@@ -4,7 +4,7 @@
 #          Alexander Tong
 #          Imahn Shekhzadeh
 import sys
-sys.path.append('/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/Latent_CFM/code/darcy_flow/')
+sys.path.append('./code/darcy_flow/')
 
 import copy
 import math
@@ -25,7 +25,7 @@ from torchcfm.conditional_flow_matching import (
     TargetConditionalFlowMatcher,
     VariancePreservingConditionalFlowMatcher,
 )
-sys.path.append('/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/Latent_CFM/code/torchcfm/models/StableDiffusion-PyTorch/')
+sys.path.append('./code/torchcfm/models/StableDiffusion-PyTorch/')
 from vae import VAE
 from torchvision.utils import make_grid
 from torchvision.transforms import ToPILImage
@@ -135,7 +135,7 @@ def kl_loss(mu, logvar):
 
 def train(rank, total_num_gpus, argv):
     if rank == 0:
-        wandb.init(project="flow_matching", entity = "anirbansamaddar00-argonne-national-laboratory")
+        wandb.init(project="flow_matching")
 
     print(
         "lr, total_steps, ema decay, save_step:",
@@ -155,7 +155,7 @@ def train(rank, total_num_gpus, argv):
         batch_size_per_gpu = FLAGS.batch_size
 
     # DATASETS/DATALOADER
-    dataset = Darcy_Dataset(path="/lcrc/project/FastBayes/Yixuan/Darcy_n16/")
+    dataset = Darcy_Dataset(path="./Darcy_n16/")
     print("Check 2")
     sampler = DistributedSampler(dataset) if FLAGS.parallel else None
     dataloader = torch.utils.data.DataLoader(
@@ -324,3 +324,18 @@ def main(argv):
 
 if __name__ == "__main__":
     app.run(main)
+
+'''
+torchrun --standalone --nnodes=1 --nproc_per_node=$NUM_GPUS vae_cifar10_ddp_medium.py \
+  --model "icfm" \
+  --output_dir "./code/darcy_flow/runs/" \
+  --lr 2e-4 \
+  --ema_decay 0.9999 \
+  --batch_size 128 \
+  --num_workers 4 \
+  --total_steps 100001 \
+  --save_step 10000 \
+  --parallel True \
+  --master_addr $MASTER_ADDR \
+  --master_port $MASTER_PORT \
+'''
