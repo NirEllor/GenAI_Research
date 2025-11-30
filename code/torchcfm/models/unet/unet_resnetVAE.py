@@ -492,6 +492,7 @@ class UNetModel(nn.Module):
         num_classes=None,
         ## Addition
         num_latents=None,
+        latent_dim=256,
         use_checkpoint=False,
         use_fp16=False,
         num_heads=1,
@@ -545,7 +546,7 @@ class UNetModel(nn.Module):
             # )
             
             # self.latent_mlp = nn.Linear(time_embed_dim, time_embed_dim)
-            self.latent_mlp = nn.Linear(math.floor(time_embed_dim/2), time_embed_dim)
+            self.latent_mlp = nn.Linear(latent_dim, time_embed_dim)
 
             # Latent size: 200 x 8 x 8 --> 512 x 1 x 1
             # self.latent_cnn = nn.Sequential(
@@ -556,7 +557,7 @@ class UNetModel(nn.Module):
             #     Downsample(time_embed_dim,True,dims=2,out_channels=time_embed_dim),
             # )
 
-            self.latent_encodings = nn.Linear(self.num_latents, time_embed_dim)
+            self.latent_encodings = nn.Linear(self.num_latents, latent_dim*2)
 
             # Latent size: 3 x 32 x 32 --> 512 x 1 x 1
             # self.latent_cnn = nn.Sequential(
@@ -1017,6 +1018,7 @@ class UNetModelWrapper(UNetModel):
         class_cond=False,
         num_classes=NUM_CLASSES,
         num_latents=None,
+        latent_dim=None,
         use_checkpoint=False,
         attention_resolutions="16",
         num_heads=1,
@@ -1063,6 +1065,7 @@ class UNetModelWrapper(UNetModel):
             channel_mult=channel_mult,
             num_classes=(num_classes if class_cond else None),
             num_latents=num_latents,
+            latent_dim=latent_dim,
             use_checkpoint=use_checkpoint,
             use_fp16=use_fp16,
             num_heads=num_heads,

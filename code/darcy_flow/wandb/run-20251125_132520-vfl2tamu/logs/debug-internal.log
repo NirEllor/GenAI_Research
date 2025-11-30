@@ -1,7 +1,0 @@
-{"time":"2025-11-25T13:25:20.589159945-06:00","level":"INFO","msg":"stream: starting","core version":"0.19.6","symlink path":"/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/Latent_CFM/code/darcy_flow/wandb/run-20251125_132520-vfl2tamu/logs/debug-core.log"}
-{"time":"2025-11-25T13:25:20.705731929-06:00","level":"INFO","msg":"created new stream","id":"vfl2tamu"}
-{"time":"2025-11-25T13:25:20.705808544-06:00","level":"INFO","msg":"stream: started","id":"vfl2tamu"}
-{"time":"2025-11-25T13:25:20.705855784-06:00","level":"INFO","msg":"sender: started","stream_id":"vfl2tamu"}
-{"time":"2025-11-25T13:25:20.705841146-06:00","level":"INFO","msg":"writer: Do: started","stream_id":"vfl2tamu"}
-{"time":"2025-11-25T13:25:20.705904005-06:00","level":"INFO","msg":"handler: started","stream_id":"vfl2tamu"}
-{"time":"2025-11-25T13:25:21.118407668-06:00","level":"INFO","msg":"Starting system monitor"}
