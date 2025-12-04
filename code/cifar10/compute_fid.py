@@ -1,6 +1,5 @@
 # Code modified from https://github.com/atong01/conditional-flow-matching/tree/main.
 
-# Authors: Anirban Samaddar
 
 
 import os
