@@ -1,6 +1,5 @@
 # Code modified from https://github.com/atong01/conditional-flow-matching/tree/main.
 
-# Authors: Anirban Samaddar
 
 # This file is for Latent CFM with 2d latent space.
 

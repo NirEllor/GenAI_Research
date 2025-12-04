@@ -1,6 +1,5 @@
 # Code modified from https://github.com/atong01/conditional-flow-matching/tree/main.
 
-# Authors: Anirban Samaddar
 
 """From https://raw.githubusercontent.com/openai/guided-diffusion/main/guided_diffusion/unet.py."""
 import sys

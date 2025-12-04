@@ -151,7 +151,7 @@ def kl_loss(mu, logvar):
 
 def train(rank, total_num_gpus, argv):
     if rank == 0:
-        wandb.init(project="flow_matching", entity = "anirbansamaddar00-argonne-national-laboratory")
+        wandb.init(project="flow_matching")
 
     print(
         "lr, total_steps, ema decay, save_step:",

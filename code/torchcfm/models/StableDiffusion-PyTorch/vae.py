@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import sys
-sys.path.append('/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/code/Latent_CFM/code/torchcfm/models/StableDiffusion-PyTorch/')
+sys.path.append('./code/torchcfm/models/StableDiffusion-PyTorch/')
 from blocks import DownBlock, MidBlock, UpBlock
 
 
