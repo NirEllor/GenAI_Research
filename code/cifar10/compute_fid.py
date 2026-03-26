@@ -106,7 +106,7 @@ new_net = UNetModelWrapper(
 vae = VAE(32, lr=0.00001)
 vae = vae.from_pretrained("cifar10-resnet18").to(device)
 vae.eval()
-dm = CIFAR10DataModule("/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/data/", normalize=True)
+dm = CIFAR10DataModule("./data/", normalize=True)
 mean = torch.tensor(dm.default_transforms().transforms[1].mean).to(device)[None,:,None,None]
 std = torch.tensor(dm.default_transforms().transforms[1].std).to(device)[None,:,None,None]
 
