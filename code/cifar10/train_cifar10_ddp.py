@@ -84,7 +84,7 @@ def train(rank, total_num_gpus, argv):
 
     # DATASETS/DATALOADER
     dataset = datasets.CIFAR10(
-        root="/lcrc/project/FastBayes/Anirban_VI/Diffusion_models/data",
+        root="./data",
         train=True,
         download=True,
         transform=transforms.Compose(
