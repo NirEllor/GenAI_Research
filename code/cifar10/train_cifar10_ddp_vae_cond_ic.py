@@ -10,6 +10,7 @@ import os
 
 import torch
 from absl import app, flags
+from cleanfid import fid
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DistributedSampler
 from torchdyn.core import NeuralODE
@@ -80,6 +81,18 @@ flags.DEFINE_integer(
     20000,
     help="frequency of saving checkpoints, 0 to disable during training",
 )
+flags.DEFINE_integer("log_every_steps", 100, help="print loss/best_loss every N steps")
+flags.DEFINE_bool("eval_fid", True, help="periodically compute FID during training (on ema_model)")
+flags.DEFINE_integer("fid_every_epochs", 50, help="compute FID every N epochs (requires --eval_fid)")
+flags.DEFINE_integer("fid_num_gen", 5000, help="number of generated images used for the periodic FID estimate")
+flags.DEFINE_integer(
+    "fid_batch_size", 250, help="batch size used when generating images for the periodic FID estimate"
+)
+flags.DEFINE_integer(
+    "fid_integration_steps",
+    50,
+    help="Euler integration steps for the periodic FID estimate (fewer = faster, less accurate than compute_fid.py)",
+)
 
 flags.DEFINE_string("restart_dir", None, "Directory to restart training from")
 
@@ -148,6 +161,39 @@ def kl_loss(mu, logvar):
     return -0.5 * (torch.sum(1 + logvar - mu.pow(2) - logvar.exp(),dim=1)).mean()
 
 
+def compute_train_fid(model, ae, fid_datalooper, parallel, num_gen, batch_size, integration_steps):
+    """Rough FID estimate for periodic training-time monitoring (not a substitute
+    for the full evaluation in compute_fid.py: fewer generated images, fewer
+    integration steps, and it runs on every rank when --parallel is set).
+    """
+    model.eval()
+    model_ = copy.deepcopy(model)
+    if parallel:
+        model_ = model_.module.to(device)
+
+    def gen_fn(unused_latent):
+        with torch.no_grad():
+            x1 = next(fid_datalooper).to(device)
+            latent = ae.encode(x1 / 2 + 0.5)[0]  # AE trained on [0,1] images, x1 is [-1,1]
+            node_ = NeuralODE(torch_wrapper(model_, y=latent), solver="euler")
+            t_span = torch.linspace(0, 1, integration_steps + 1, device=device)
+            traj = node_.trajectory(torch.randn(x1.size(0), 3, 32, 32, device=device), t_span=t_span)
+        img = traj[-1]
+        return (img * 127.5 + 128).clip(0, 255).to(torch.uint8)
+
+    score = fid.compute_fid(
+        gen=gen_fn,
+        dataset_name="cifar10",
+        dataset_res=32,
+        dataset_split="train",
+        mode="legacy_tensorflow",
+        num_gen=num_gen,
+        batch_size=batch_size,
+    )
+    model.train()
+    return score
+
+
 def train(rank, total_num_gpus, argv):
     print(
         "lr, total_steps, ema decay, save_step:",
@@ -192,6 +238,29 @@ def train(rank, total_num_gpus, argv):
     )
 
     datalooper = infiniteloop(dataloader)
+
+    fid_datalooper = None
+    if FLAGS.eval_fid:
+        fid_dataset = datasets.CIFAR10(
+            root="./data",
+            train=True,
+            download=True,
+            transform=transforms.Compose(
+                [
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+                ]
+            ),
+        )
+        fid_dataloader = torch.utils.data.DataLoader(
+            fid_dataset,
+            batch_size=FLAGS.fid_batch_size,
+            shuffle=True,
+            num_workers=2,
+            drop_last=True,
+            pin_memory=True,
+        )
+        fid_datalooper = infiniteloop(fid_dataloader)
 
     # Calculate number of epochs
     steps_per_epoch = math.ceil(len(dataset) / FLAGS.batch_size)
@@ -311,12 +380,17 @@ def train(rank, total_num_gpus, argv):
         num_epochs = num_epochs - num_epochs_run
     else:
         global_step = 0
+
+    best_loss = float("inf")
+    best_fid = float("inf")
+
     with trange(num_epochs, dynamic_ncols=True) as epoch_pbar:
         for epoch in epoch_pbar:
             epoch_pbar.set_description(f"Epoch {epoch + 1}/{num_epochs}")
             if sampler is not None:
                 sampler.set_epoch(epoch)
 
+            epoch_loss_sum = 0.0
             with trange(steps_per_epoch, dynamic_ncols=True) as step_pbar:
                 for step in step_pbar:
                     global_step += 1
@@ -336,6 +410,17 @@ def train(rank, total_num_gpus, argv):
                     sched.step()
                     ema(net_model, ema_model, FLAGS.ema_decay)  # new
 
+                    loss_value = loss.item()
+                    epoch_loss_sum += loss_value
+                    if loss_value < best_loss:
+                        best_loss = loss_value
+                    step_pbar.set_postfix(loss=f"{loss_value:.4f}", best_loss=f"{best_loss:.4f}")
+                    if global_step % FLAGS.log_every_steps == 0 or global_step == 1:
+                        print(
+                            f"[step {global_step}] loss={loss_value:.6f} best_loss={best_loss:.6f}",
+                            flush=True,
+                        )
+
                     # sample and Saving the weights
                     if (FLAGS.save_step > 0 and global_step % FLAGS.save_step == 0) or global_step == 1:
                         generate_sample_trajectories(
@@ -354,6 +439,31 @@ def train(rank, total_num_gpus, argv):
                             },
                             savedir + f"Cifar10_weights_step_{global_step}_latent{FLAGS.latent_dim}_Lcfm.pt",
                         )
+
+            epoch_avg_loss = epoch_loss_sum / steps_per_epoch
+            print(
+                f"[epoch {epoch + 1}/{num_epochs}] step={global_step} "
+                f"avg_loss={epoch_avg_loss:.6f} best_loss={best_loss:.6f}",
+                flush=True,
+            )
+
+            if FLAGS.eval_fid and (epoch + 1) % FLAGS.fid_every_epochs == 0:
+                fid_score = compute_train_fid(
+                    ema_model,
+                    ae,
+                    fid_datalooper,
+                    FLAGS.parallel,
+                    num_gen=FLAGS.fid_num_gen,
+                    batch_size=FLAGS.fid_batch_size,
+                    integration_steps=FLAGS.fid_integration_steps,
+                )
+                if fid_score < best_fid:
+                    best_fid = fid_score
+                print(
+                    f"[epoch {epoch + 1}/{num_epochs}] step={global_step} "
+                    f"FID({FLAGS.fid_num_gen})={fid_score:.4f} best_FID={best_fid:.4f}",
+                    flush=True,
+                )
 
 
 
