@@ -17,8 +17,8 @@ sys.path.append('./code/torchcfm/models/unet/')
 from unet_resnetVAE import UNetModelWrapper
 from pathlib import Path
 import argparse
-from pl_bolts.models.autoencoders import VAE
-from pl_bolts.datamodules import CIFAR10DataModule
+sys.path.append('./code/torchcfm/models/StableDiffusion-PyTorch/')
+from vae import DeterministicAE, ae_model_config, latent_dim_to_z_channels
 from utils_cifar import infiniteloop, tile_image
 from torchvision import datasets, transforms
 from torchvision.utils import make_grid, save_image
@@ -40,9 +40,15 @@ flags.DEFINE_float("tol", 1e-5, help="Integrator tolerance (absolute and relativ
 flags.DEFINE_integer("batch_size_fid", 1024, help="Batch size to compute FID")
 flags.DEFINE_bool('ema',True, help='Use EMA model')
 flags.DEFINE_integer("class_cond", 0, help="Residual type - 0: no class, 1: dispatcher, 2: clust_id")
+flags.DEFINE_integer("unet_latent_dim", 256, help="width of the UNet's own internal latent conditioning bottleneck")
+flags.DEFINE_integer("latent_dim", None, help="flat latent dimension of the AE, e.g. 64/128/256/384/512/1024 (required if class_cond=1)")
+flags.DEFINE_string("ae_checkpoint", None, help="path to a checkpoint produced by train_cifar10_ae_ddp.py (required if class_cond=1)")
 
 FLAGS(sys.argv)
 
+if FLAGS.class_cond == 1:
+    assert FLAGS.latent_dim is not None, "--latent_dim is required when --class_cond=1"
+    assert FLAGS.ae_checkpoint is not None, "--ae_checkpoint is required when --class_cond=1"
 
 # Define the model
 use_cuda = torch.cuda.is_available()
@@ -98,25 +104,34 @@ new_net = UNetModelWrapper(
         attention_resolutions="16",
         dropout=0.1,
         num_classes=None,
-        num_latents=512 if FLAGS.class_cond == 1 else None,
+        num_latents=FLAGS.latent_dim if FLAGS.class_cond == 1 else None,
+        latent_dim=FLAGS.unet_latent_dim,
         class_cond= False,
     ).to(device)
-    
 
-vae = VAE(32, lr=0.00001)
-vae = vae.from_pretrained("cifar10-resnet18").to(device)
-vae.eval()
-dm = CIFAR10DataModule("./data/", normalize=True)
-mean = torch.tensor(dm.default_transforms().transforms[1].mean).to(device)[None,:,None,None]
-std = torch.tensor(dm.default_transforms().transforms[1].std).to(device)[None,:,None,None]
+
+if FLAGS.class_cond == 1:
+    z_channels = latent_dim_to_z_channels(FLAGS.latent_dim)
+    ae = DeterministicAE(im_channels=3, model_config=ae_model_config(z_channels)).to(device)
+    ae_checkpoint = torch.load(FLAGS.ae_checkpoint, map_location=device)
+    try:
+        ae.load_state_dict(ae_checkpoint["ae"])
+    except RuntimeError:
+        from collections import OrderedDict
+
+        new_state_dict = OrderedDict()
+        for k, v in ae_checkpoint["ae"].items():
+            new_state_dict[k[7:]] = v
+        ae.load_state_dict(new_state_dict)
+    ae.eval()
 
 
 
 # Load the model
 if FLAGS.class_cond == 0:
-    PATH = f"{FLAGS.input_dir}/{FLAGS.model}/Cifar10_weights_step_{FLAGS.step}.pt" 
+    PATH = f"{FLAGS.input_dir}/{FLAGS.model}/Cifar10_weights_step_{FLAGS.step}.pt"
 elif FLAGS.class_cond == 1:
-    PATH = f"{FLAGS.input_dir}/{FLAGS.model}/Cifar10_weights_step_{FLAGS.step}_Lcfm.pt"
+    PATH = f"{FLAGS.input_dir}/{FLAGS.model}/Cifar10_weights_step_{FLAGS.step}_latent{FLAGS.latent_dim}_Lcfm.pt"
 
 print("path: ", PATH)
 checkpoint = torch.load(PATH, map_location=device)
@@ -142,12 +157,8 @@ def gen_1_img(unused_latent):
             x = torch.randn(FLAGS.batch_size_fid, 3, 32, 32, device=device) if FLAGS.base_dist == 'normal' else sample((FLAGS.batch_size_fid,), params).to(device).view(-1, 3, 32, 32)
         elif FLAGS.class_cond == 1:
             x1 = next(datalooper).to(device)
-            renormalized_input = x1*0.5 + 0.5
-            renormalized_input = (renormalized_input - mean) / std
-            output_img = vae(renormalized_input)
-            unnormalize = transforms.Normalize((-mean / std).tolist(), (1.0 / std).tolist())
-            output_img = unnormalize(renormalized_input)
-            latent = vae.encoder(renormalized_input).view(FLAGS.batch_size_fid, -1)
+            output_img = x1 / 2 + 0.5  # real conditioning images, [-1,1] -> [0,1] for display
+            latent = ae.encode(x1).view(FLAGS.batch_size_fid, -1)
 
             output_tiled = tile_image(output_img[:100,], 10).cpu().numpy().transpose(1, 2, 0)
             output_tiled = np.asarray(output_tiled * 255, dtype=np.uint8)
@@ -186,13 +197,13 @@ def gen_1_img(unused_latent):
     traj = traj[:100,].view([-1, 3, 32, 32]).clip(-1, 1)
     traj = traj / 2 + 0.5
     if FLAGS.class_cond == 1:
-        save_image(traj, f"{FLAGS.input_dir}/{FLAGS.model}/Generated_images_cifar10_weights_step_{FLAGS.step}_Lcfm.png", nrow=10)
+        save_image(traj, f"{FLAGS.input_dir}/{FLAGS.model}/Generated_images_cifar10_weights_step_{FLAGS.step}_latent{FLAGS.latent_dim}_Lcfm.png", nrow=10)
     else:
         save_image(traj, f"{FLAGS.input_dir}/{FLAGS.model}/Generated_images_cifar10_weights_step_{FLAGS.step}_icfm.png", nrow=10)
 
     if FLAGS.class_cond == 1:
             plt.imshow(output_tiled)
-            plt.savefig(f"{FLAGS.input_dir}/{FLAGS.model}/Original_images_cifar10_weights_step_{FLAGS.step}_Lcfm.png")
+            plt.savefig(f"{FLAGS.input_dir}/{FLAGS.model}/Original_images_cifar10_weights_step_{FLAGS.step}_latent{FLAGS.latent_dim}_Lcfm.png")
             plt.close()
     return img
 
@@ -218,9 +229,9 @@ print("FID: ", score)
 '''
 Usage:
 
-nohup python3 compute_fid.py --integration_method 'euler' --class_cond 1 --model "icfm" --step 600000 --input_dir ./code/cifar10/runs/ &> ./logs/FID_cifar_ema_600K_Lcfm_euler.log &
-nohup python3 compute_fid.py --integration_method 'euler' --integration_steps 1000 --class_cond 1 --model "icfm" --step 600000 --input_dir ./code/cifar10/runs/ &> ./logs/FID_cifar_ema_600K_Lcfm_euler_1000.log &
-nohup python3 compute_fid.py --integration_method 'dopri5' --class_cond 1 --model "icfm" --step 600000 --input_dir ./code/cifar10/runs/ &> ./logs/FID_cifar_ema_600K_Lcfm_dopri.log &
+nohup python3 compute_fid.py --integration_method 'euler' --class_cond 1 --model "icfm" --step 600000 --input_dir ./code/cifar10/runs/ --latent_dim 256 --ae_checkpoint ./code/cifar10/runs/ae_latent256/cifar10_ae_weights_step_400000_latent256.pt &> ./logs/FID_cifar_ema_600K_Lcfm_euler.log &
+nohup python3 compute_fid.py --integration_method 'euler' --integration_steps 1000 --class_cond 1 --model "icfm" --step 600000 --input_dir ./code/cifar10/runs/ --latent_dim 256 --ae_checkpoint ./code/cifar10/runs/ae_latent256/cifar10_ae_weights_step_400000_latent256.pt &> ./logs/FID_cifar_ema_600K_Lcfm_euler_1000.log &
+nohup python3 compute_fid.py --integration_method 'dopri5' --class_cond 1 --model "icfm" --step 600000 --input_dir ./code/cifar10/runs/ --latent_dim 256 --ae_checkpoint ./code/cifar10/runs/ae_latent256/cifar10_ae_weights_step_400000_latent256.pt &> ./logs/FID_cifar_ema_600K_Lcfm_dopri.log &
 
 
 '''

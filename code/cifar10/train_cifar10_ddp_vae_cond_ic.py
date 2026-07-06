@@ -32,8 +32,8 @@ from pathlib import Path
 import argparse
 from types import SimpleNamespace
 from torchvision.utils import make_grid, save_image
-from pl_bolts.models.autoencoders import VAE
-from pl_bolts.datamodules import CIFAR10DataModule
+sys.path.append('./code/torchcfm/models/StableDiffusion-PyTorch/')
+from vae import DeterministicAE, ae_model_config, latent_dim_to_z_channels
 
 print(f"Visible GPUs: {torch.cuda.device_count()}")
 print(f"Available GPU Devices: {[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]}")
@@ -44,6 +44,19 @@ flags.DEFINE_string("model", "otcfm", help="flow matching model type")
 flags.DEFINE_string("output_dir", "./results/", help="output_directory")
 # UNet
 flags.DEFINE_integer("num_channel", 128, help="base channel of UNet")
+flags.DEFINE_integer(
+    "unet_latent_dim", 256, help="width of the UNet's own internal latent conditioning bottleneck"
+)
+
+# Deterministic AE (latent conditioning source)
+flags.DEFINE_integer(
+    "latent_dim", None, help="flat latent dimension of the AE, e.g. 64/128/256/384/512/1024"
+)
+flags.DEFINE_string(
+    "ae_checkpoint", None, help="path to a checkpoint produced by train_cifar10_ae_ddp.py"
+)
+flags.mark_flag_as_required("latent_dim")
+flags.mark_flag_as_required("ae_checkpoint")
 
 # Training
 flags.DEFINE_float("lr", 2e-4, help="target learning rate")  # TRY 2e-4
@@ -88,7 +101,7 @@ class torch_wrapper(torch.nn.Module):
 
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
-def generate_sample_trajectories(model, parallel, savedir, step, net_="normal",train_sample=None,vae=None):
+def generate_sample_trajectories(model, parallel, savedir, step, net_="normal",train_sample=None,ae=None):
     """Save 10 generated images trajectories for sanity check along training.
 
     Parameters
@@ -105,26 +118,19 @@ def generate_sample_trajectories(model, parallel, savedir, step, net_="normal",t
     model.eval()
 
     model_ = copy.deepcopy(model)
-    vae_ = copy.deepcopy(vae)
-    train_sample,mean,std = train_sample
+    ae_ = copy.deepcopy(ae)
     if parallel:
         # Send the models from GPU to CPU for inference with NeuralODE from Torchdyn
         model_ = model_.module.to(device)
         model_.training = True
         x1 = train_sample.to(device)
-        mean = mean.to(device)
-        std = std.to(device)
-        vae_ = vae_.to(device)
+        ae_ = ae_.to(device)
+    else:
+        x1 = train_sample
 
-    
     traj_id = [j for j in range(0,100,10)]
     with torch.no_grad():
-        renormalized_input = x1*0.5 + 0.5
-        renormalized_input = (renormalized_input - mean) / std
-        latent = vae_.encoder(renormalized_input).view(renormalized_input.size(0),-1)
-        # mu = vae_.fc_mu(l0)
-        # log_var = vae_.fc_var(l0)
-        # _,_,latent = vae_.sample(mu, log_var)
+        latent = ae_.encode(x1).view(x1.size(0),-1)
         node_ = NeuralODE(torch_wrapper(model_,y=latent.to(device)), solver="euler", sensitivity="adjoint")
         traj = node_.trajectory(
                 torch.randn(10,3,32,32).to(device),
@@ -133,8 +139,8 @@ def generate_sample_trajectories(model, parallel, savedir, step, net_="normal",t
         traj = traj.transpose(0,1)
         traj = traj[:,traj_id].view([-1, 3, 32, 32]).clip(-1, 1)
         traj = traj / 2 + 0.5
-    
-    save_image(traj, savedir + f"{net_}_generated_KDE_FM_images_step_{step}_vae_cond_kl_rep2.png", nrow=10)
+
+    save_image(traj, savedir + f"{net_}_generated_KDE_FM_images_step_{step}_ae_cond_latent{FLAGS.latent_dim}.png", nrow=10)
 
     model.train()
 
@@ -212,18 +218,31 @@ def train(rank, total_num_gpus, argv):
         num_head_channels=64,
         attention_resolutions="16",
         dropout=0.1,
-        num_latents=512,
+        num_latents=FLAGS.latent_dim,
+        latent_dim=FLAGS.unet_latent_dim,
     ).to(
         rank
     )  # new dropout + bs of 128
     net_model.training = True
 
-    vae = VAE(32, lr=0.00001)
-    vae = vae.from_pretrained("cifar10-resnet18").to(rank)
-    vae.eval()
-    dm = CIFAR10DataModule("./data/", normalize=True)
-    mean = torch.tensor(dm.default_transforms().transforms[1].mean).to(rank)[None,:,None,None]
-    std = torch.tensor(dm.default_transforms().transforms[1].std).to(rank)[None,:,None,None]
+    z_channels = latent_dim_to_z_channels(FLAGS.latent_dim)
+    ae_model_cfg = ae_model_config(z_channels)
+    ae = DeterministicAE(im_channels=3, model_config=ae_model_cfg).to(rank)
+    ae_checkpoint = torch.load(
+        FLAGS.ae_checkpoint, map_location=f"cuda:{rank}" if use_cuda else "cpu"
+    )
+    try:
+        ae.load_state_dict(ae_checkpoint["ae"])
+    except RuntimeError:
+        from collections import OrderedDict
+
+        new_state_dict = OrderedDict()
+        for k, v in ae_checkpoint["ae"].items():
+            new_state_dict[k[7:]] = v
+        ae.load_state_dict(new_state_dict)
+    ae.eval()
+    for p in ae.parameters():
+        p.requires_grad_(False)
 
 
 
@@ -307,13 +326,8 @@ def train(rank, total_num_gpus, argv):
                     optim.zero_grad()
                     x1 = next(datalooper).to(rank)
                     with torch.no_grad():
-                        renormalized_input = x1*0.5 + 0.5
-                        renormalized_input = (renormalized_input - mean) / std
-                        latent = vae.encoder(renormalized_input).view(renormalized_input.size(0),-1)
-                        # mu = vae.fc_mu(l0)
-                        # log_var = vae.fc_var(l0)
-                        # _,_,latent = vae.sample(mu, log_var)
-                    
+                        latent = ae.encode(x1).view(x1.size(0),-1)
+
                     x0 = torch.randn_like(x1)
                     t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1)
                     vt,mu,logvar = net_model(t, xt,y=latent)
@@ -327,10 +341,10 @@ def train(rank, total_num_gpus, argv):
                     # sample and Saving the weights
                     if (FLAGS.save_step > 0 and global_step % FLAGS.save_step == 0) or global_step == 1:
                         generate_sample_trajectories(
-                            net_model, FLAGS.parallel, savedir, global_step, net_="normal", train_sample=[x1[:10],mean,std], vae=vae
+                            net_model, FLAGS.parallel, savedir, global_step, net_="normal", train_sample=x1[:10], ae=ae
                         )
                         generate_sample_trajectories(
-                            ema_model, FLAGS.parallel, savedir, global_step, net_="ema", train_sample=[x1[:10],mean,std], vae=vae
+                            ema_model, FLAGS.parallel, savedir, global_step, net_="ema", train_sample=x1[:10], ae=ae
                         )
                         torch.save(
                             {
@@ -340,7 +354,7 @@ def train(rank, total_num_gpus, argv):
                                 "optim": optim.state_dict(),
                                 "step": global_step,
                             },
-                            savedir + f"Cifar10_weights_step_{global_step}_Lcfm.pt",
+                            savedir + f"Cifar10_weights_step_{global_step}_latent{FLAGS.latent_dim}_Lcfm.pt",
                         )
 
 
