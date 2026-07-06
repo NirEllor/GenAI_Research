@@ -32,8 +32,8 @@ from pathlib import Path
 import argparse
 from types import SimpleNamespace
 from torchvision.utils import make_grid, save_image
-sys.path.append('./code/torchcfm/models/StableDiffusion-PyTorch/')
-from vae import DeterministicAE, ae_model_config, latent_dim_to_z_channels
+sys.path.append('./code/torchcfm/models/')
+from conv_autoencoder import ConvAutoencoder
 
 print(f"Visible GPUs: {torch.cuda.device_count()}")
 print(f"Available GPU Devices: {[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]}")
@@ -53,7 +53,7 @@ flags.DEFINE_integer(
     "latent_dim", None, help="flat latent dimension of the AE, e.g. 64/128/256/384/512/1024"
 )
 flags.DEFINE_string(
-    "ae_checkpoint", None, help="path to a checkpoint produced by train_cifar10_ae_ddp.py"
+    "ae_checkpoint", None, help="path to an ae_<dim>.pt checkpoint (dict with 'latent_dim'/'state_dict' keys)"
 )
 flags.mark_flag_as_required("latent_dim")
 flags.mark_flag_as_required("ae_checkpoint")
@@ -130,7 +130,7 @@ def generate_sample_trajectories(model, parallel, savedir, step, net_="normal",t
 
     traj_id = [j for j in range(0,100,10)]
     with torch.no_grad():
-        latent = ae_.encode(x1).view(x1.size(0),-1)
+        latent = ae_.encode(x1 / 2 + 0.5)[0]  # AE trained on [0,1] images, x1 is [-1,1]
         node_ = NeuralODE(torch_wrapper(model_,y=latent.to(device)), solver="euler", sensitivity="adjoint")
         traj = node_.trajectory(
                 torch.randn(10,3,32,32).to(device),
@@ -225,19 +225,17 @@ def train(rank, total_num_gpus, argv):
     )  # new dropout + bs of 128
     net_model.training = True
 
-    z_channels = latent_dim_to_z_channels(FLAGS.latent_dim)
-    ae_model_cfg = ae_model_config(z_channels)
-    ae = DeterministicAE(im_channels=3, model_config=ae_model_cfg).to(rank)
+    ae = ConvAutoencoder(latent_dim=FLAGS.latent_dim).to(rank)
     ae_checkpoint = torch.load(
         FLAGS.ae_checkpoint, map_location=f"cuda:{rank}" if use_cuda else "cpu"
     )
     try:
-        ae.load_state_dict(ae_checkpoint["ae"])
+        ae.load_state_dict(ae_checkpoint["state_dict"])
     except RuntimeError:
         from collections import OrderedDict
 
         new_state_dict = OrderedDict()
-        for k, v in ae_checkpoint["ae"].items():
+        for k, v in ae_checkpoint["state_dict"].items():
             new_state_dict[k[7:]] = v
         ae.load_state_dict(new_state_dict)
     ae.eval()
@@ -326,7 +324,7 @@ def train(rank, total_num_gpus, argv):
                     optim.zero_grad()
                     x1 = next(datalooper).to(rank)
                     with torch.no_grad():
-                        latent = ae.encode(x1).view(x1.size(0),-1)
+                        latent = ae.encode(x1 / 2 + 0.5)[0]  # AE trained on [0,1] images, x1 is [-1,1]
 
                     x0 = torch.randn_like(x1)
                     t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1)

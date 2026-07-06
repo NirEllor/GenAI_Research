@@ -17,8 +17,8 @@ sys.path.append('./code/torchcfm/models/unet/')
 from unet_resnetVAE import UNetModelWrapper
 from pathlib import Path
 import argparse
-sys.path.append('./code/torchcfm/models/StableDiffusion-PyTorch/')
-from vae import DeterministicAE, ae_model_config, latent_dim_to_z_channels
+sys.path.append('./code/torchcfm/models/')
+from conv_autoencoder import ConvAutoencoder
 from utils_cifar import infiniteloop, tile_image
 from torchvision import datasets, transforms
 from torchvision.utils import make_grid, save_image
@@ -42,7 +42,7 @@ flags.DEFINE_bool('ema',True, help='Use EMA model')
 flags.DEFINE_integer("class_cond", 0, help="Residual type - 0: no class, 1: dispatcher, 2: clust_id")
 flags.DEFINE_integer("unet_latent_dim", 256, help="width of the UNet's own internal latent conditioning bottleneck")
 flags.DEFINE_integer("latent_dim", None, help="flat latent dimension of the AE, e.g. 64/128/256/384/512/1024 (required if class_cond=1)")
-flags.DEFINE_string("ae_checkpoint", None, help="path to a checkpoint produced by train_cifar10_ae_ddp.py (required if class_cond=1)")
+flags.DEFINE_string("ae_checkpoint", None, help="path to an ae_<dim>.pt checkpoint (dict with 'latent_dim'/'state_dict' keys, required if class_cond=1)")
 
 FLAGS(sys.argv)
 
@@ -111,16 +111,15 @@ new_net = UNetModelWrapper(
 
 
 if FLAGS.class_cond == 1:
-    z_channels = latent_dim_to_z_channels(FLAGS.latent_dim)
-    ae = DeterministicAE(im_channels=3, model_config=ae_model_config(z_channels)).to(device)
+    ae = ConvAutoencoder(latent_dim=FLAGS.latent_dim).to(device)
     ae_checkpoint = torch.load(FLAGS.ae_checkpoint, map_location=device)
     try:
-        ae.load_state_dict(ae_checkpoint["ae"])
+        ae.load_state_dict(ae_checkpoint["state_dict"])
     except RuntimeError:
         from collections import OrderedDict
 
         new_state_dict = OrderedDict()
-        for k, v in ae_checkpoint["ae"].items():
+        for k, v in ae_checkpoint["state_dict"].items():
             new_state_dict[k[7:]] = v
         ae.load_state_dict(new_state_dict)
     ae.eval()
@@ -158,7 +157,7 @@ def gen_1_img(unused_latent):
         elif FLAGS.class_cond == 1:
             x1 = next(datalooper).to(device)
             output_img = x1 / 2 + 0.5  # real conditioning images, [-1,1] -> [0,1] for display
-            latent = ae.encode(x1).view(FLAGS.batch_size_fid, -1)
+            latent = ae.encode(output_img)[0]  # AE trained on [0,1] images
 
             output_tiled = tile_image(output_img[:100,], 10).cpu().numpy().transpose(1, 2, 0)
             output_tiled = np.asarray(output_tiled * 255, dtype=np.uint8)
