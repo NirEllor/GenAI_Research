@@ -144,6 +144,9 @@ def generate_sample_trajectories(model, parallel, savedir, step, net_="normal",t
     traj_id = [j for j in range(0,100,10)]
     with torch.no_grad():
         latent = ae_.encode(x1 / 2 + 0.5)[0]  # AE trained on [0,1] images, x1 is [-1,1]
+        proj = model_.latent_encodings(latent)
+        mu, logvar = proj.chunk(2, dim=1)
+        latent = mu + torch.randn_like(mu) * torch.exp(logvar * 0.5)
         node_ = NeuralODE(torch_wrapper(model_,y=latent.to(device)), solver="euler", sensitivity="adjoint")
         traj = node_.trajectory(
                 torch.randn(10,3,32,32).to(device),
@@ -175,6 +178,9 @@ def compute_train_fid(model, ae, fid_datalooper, parallel, num_gen, batch_size, 
         with torch.no_grad():
             x1 = next(fid_datalooper).to(device)
             latent = ae.encode(x1 / 2 + 0.5)[0]  # AE trained on [0,1] images, x1 is [-1,1]
+            proj = model_.latent_encodings(latent)
+            mu, logvar = proj.chunk(2, dim=1)
+            latent = mu + torch.randn_like(mu) * torch.exp(logvar * 0.5)
             node_ = NeuralODE(torch_wrapper(model_, y=latent), solver="euler")
             t_span = torch.linspace(0, 1, integration_steps + 1, device=device)
             traj = node_.trajectory(torch.randn(x1.size(0), 3, 32, 32, device=device), t_span=t_span)
