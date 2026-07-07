@@ -195,6 +195,7 @@ def compute_train_fid(model, ae, fid_datalooper, parallel, num_gen, batch_size, 
 
 
 def train(rank, total_num_gpus, argv):
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() and rank != "cpu" else "cpu")
     print(
         "lr, total_steps, ema decay, save_step:",
         FLAGS.lr,
@@ -294,9 +295,10 @@ def train(rank, total_num_gpus, argv):
     )  # new dropout + bs of 128
     net_model.training = True
 
-    ae = ConvAutoencoder(latent_dim=FLAGS.latent_dim).to(rank)
+    ae = ConvAutoencoder(latent_dim=FLAGS.latent_dim).to(device)
     ae_checkpoint = torch.load(
-        FLAGS.ae_checkpoint, map_location=f"cuda:{rank}" if use_cuda else "cpu"
+        FLAGS.ae_checkpoint,
+        map_location=device
     )
     try:
         ae.load_state_dict(ae_checkpoint["state_dict"])
@@ -320,7 +322,7 @@ def train(rank, total_num_gpus, argv):
     sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
 
     if FLAGS.restart_dir is not None:
-        checkpoint = torch.load(FLAGS.restart_dir, map_location=f"cuda:{rank}")
+        checkpoint = torch.load(FLAGS.restart_dir, map_location=device)
         try:
             net_model.load_state_dict(checkpoint["net_model"])
         except RuntimeError:
@@ -396,7 +398,7 @@ def train(rank, total_num_gpus, argv):
                     global_step += 1
 
                     optim.zero_grad()
-                    x1 = next(datalooper).to(rank)
+                    x1 = next(datalooper).to(device)
                     with torch.no_grad():
                         latent = ae.encode(x1 / 2 + 0.5)[0]  # AE trained on [0,1] images, x1 is [-1,1]
 
@@ -468,15 +470,12 @@ def train(rank, total_num_gpus, argv):
 
 
 def main(argv):
-    # get world size (number of GPUs)
     total_num_gpus = int(os.getenv("WORLD_SIZE", 1))
 
     if FLAGS.parallel and total_num_gpus > 1:
         train(rank=int(os.getenv("RANK", 0)), total_num_gpus=total_num_gpus, argv=argv)
     else:
-        use_cuda = torch.cuda.is_available()
-        device = torch.device("cuda" if use_cuda else "cpu")
-        train(rank=device, total_num_gpus=total_num_gpus, argv=argv)
+        train(rank=0 if torch.cuda.is_available() else "cpu", total_num_gpus=total_num_gpus, argv=argv)
 
 
 if __name__ == "__main__":
