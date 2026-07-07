@@ -6,6 +6,5 @@ NODE_ARGS=""
 
 PROJECT="/cs/labs/raananf/ellorw.nir/distillation/GenAI_Research"
 
-RUN="source /cs/labs/raananf/ellorw.nir/venv/bin/activate && cd $PROJECT &&"
-
+RUN="source /cs/labs/raananf/ellorw.nir/venv/bin/activate && cd $PROJECT && export PYTHONPATH=$PROJECT/code:\$PYTHONPATH &&"
 DIMS=(64 128 256 384 512 1024)
