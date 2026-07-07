@@ -216,7 +216,7 @@ def train(rank, total_num_gpus, argv):
     dataset = datasets.CIFAR10(
         root="./data",
         train=True,
-        download=True,
+        download=False,
         transform=transforms.Compose(
             [
                 transforms.RandomHorizontalFlip(),
@@ -244,7 +244,7 @@ def train(rank, total_num_gpus, argv):
         fid_dataset = datasets.CIFAR10(
             root="./data",
             train=True,
-            download=True,
+            download=False,
             transform=transforms.Compose(
                 [
                     transforms.ToTensor(),
