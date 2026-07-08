@@ -273,6 +273,21 @@ def train(rank, total_num_gpus, argv):
         flush=True,
     )
 
+    savedir = FLAGS.output_dir + FLAGS.model + "/"
+    os.makedirs(savedir, exist_ok=True)
+
+    latest_ckpt_path = savedir + f"latest_latent{FLAGS.latent_dim}_Lcfm.pt"
+    if FLAGS.restart_dir is None and os.path.exists(latest_ckpt_path):
+        latest_ckpt = torch.load(latest_ckpt_path, map_location="cpu")
+        completed_epoch = latest_ckpt.get("epoch", 0)
+        if completed_epoch >= num_epochs:
+            print(
+                f"[dim={FLAGS.latent_dim}] found completed checkpoint at {latest_ckpt_path} "
+                f"(epoch {completed_epoch}/{num_epochs}) — skipping training.",
+                flush=True,
+            )
+            return
+
     # MODELS
     net_model = UNetModelWrapper(
         dim=(3, 32, 32),
@@ -365,9 +380,6 @@ def train(rank, total_num_gpus, argv):
         raise NotImplementedError(
             f"Unknown model {FLAGS.model}, must be one of ['otcfm', 'icfm', 'fm', 'si']"
         )
-
-    savedir = FLAGS.output_dir + FLAGS.model + "/"
-    os.makedirs(savedir, exist_ok=True)
 
     if FLAGS.restart_dir is not None:
         #global_step = 100000  # Chnage this according to the last run
