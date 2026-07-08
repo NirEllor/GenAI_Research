@@ -734,7 +734,6 @@ class UNetModel(nn.Module):
         ) or (self.num_latents is not None), "must specify y if and only if the model is class-conditional"
         
         while timesteps.dim() > 1:
-            print(timesteps.shape)
             timesteps = timesteps[:, 0]
         if timesteps.dim() == 0:
             timesteps = timesteps.repeat(x.shape[0])
@@ -765,7 +764,6 @@ class UNetModel(nn.Module):
                 mu,logvar = None,None
                 proj = self.latent_mlp(proj)
                 proj = th.where(th.sum(th.abs(y),dim=-1,keepdim=True).repeat(1,proj.shape[-1]) > 1e-5, proj, th.zeros_like(proj))
-                print(proj.abs().sum(),flush=True)
                 emb = emb + proj
 
         h = x.type(self.dtype)

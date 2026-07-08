@@ -30,14 +30,11 @@ from torchvision.utils import make_grid
 from torchvision.transforms import ToPILImage
 import matplotlib.pyplot as plt
 from pathlib import Path
-import argparse
 from types import SimpleNamespace
 from torchvision.utils import make_grid, save_image
 sys.path.append('./code/torchcfm/models/')
 from conv_autoencoder import ConvAutoencoder
 
-print(f"Visible GPUs: {torch.cuda.device_count()}")
-print(f"Available GPU Devices: {[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]}")
 
 FLAGS = flags.FLAGS
 
@@ -65,6 +62,7 @@ flags.DEFINE_float("grad_clip", 1.0, help="gradient norm clipping")
 flags.DEFINE_integer(
     "total_steps", 400001, help="total training steps"
 )  # Lipman et al uses 400k but double batch size
+flags.DEFINE_integer("max_epochs", 800, help="hard cap on number of epochs, regardless of total_steps")
 flags.DEFINE_integer("warmup", 5000, help="learning rate warmup")
 flags.DEFINE_integer("batch_size", 128, help="batch size")  # Lipman et al uses 128
 flags.DEFINE_integer("num_workers", 4, help="workers of Dataloader")
@@ -203,14 +201,11 @@ def compute_train_fid(model, ae, fid_datalooper, parallel, num_gen, batch_size, 
 def train(rank, total_num_gpus, argv):
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() and rank != "cpu" else "cpu")
     print(
-        "lr, total_steps, ema decay, save_step:",
-        FLAGS.lr,
-        FLAGS.total_steps,
-        FLAGS.ema_decay,
-        FLAGS.save_step,
+        f"[dim={FLAGS.latent_dim}] lr={FLAGS.lr} total_steps={FLAGS.total_steps} "
+        f"max_epochs={FLAGS.max_epochs} ema_decay={FLAGS.ema_decay} save_step={FLAGS.save_step}",
+        flush=True,
     )
 
-    print("Check 1")
     if FLAGS.parallel and total_num_gpus > 1:
         # When using `DistributedDataParallel`, we need to divide the batch
         # size ourselves based on the total number of GPUs of the current node.
@@ -232,7 +227,7 @@ def train(rank, total_num_gpus, argv):
             ]
         ),
     )
-    print("Check 2")
+    print(f"[dim={FLAGS.latent_dim}] CIFAR10 dataset loaded: {len(dataset)} train images", flush=True)
     sampler = DistributedSampler(dataset) if FLAGS.parallel else None
     dataloader = torch.utils.data.DataLoader(
         dataset,
@@ -271,18 +266,12 @@ def train(rank, total_num_gpus, argv):
 
     # Calculate number of epochs
     steps_per_epoch = math.ceil(len(dataset) / FLAGS.batch_size)
-    num_epochs = math.ceil(FLAGS.total_steps / steps_per_epoch)
-
-    print("Check 3")
-
-    print("Check 4")
-    ### Load KDE
-    seed = 0
-    args_data = argparse.Namespace()
-    args_data.type = 'cifar10'
-
-
-    print("Check 5")
+    num_epochs = min(math.ceil(FLAGS.total_steps / steps_per_epoch), FLAGS.max_epochs)
+    print(
+        f"[dim={FLAGS.latent_dim}] steps_per_epoch={steps_per_epoch} num_epochs={num_epochs} "
+        f"(capped at max_epochs={FLAGS.max_epochs})",
+        flush=True,
+    )
 
     # MODELS
     net_model = UNetModelWrapper(
@@ -319,9 +308,7 @@ def train(rank, total_num_gpus, argv):
     for p in ae.parameters():
         p.requires_grad_(False)
 
-
-
-    print("Check 6")
+    print(f"[dim={FLAGS.latent_dim}] AE checkpoint loaded from {FLAGS.ae_checkpoint}", flush=True)
 
     ema_model = copy.deepcopy(net_model)
     optim = torch.optim.Adam(net_model.parameters(), lr=FLAGS.lr)
@@ -359,7 +346,7 @@ def train(rank, total_num_gpus, argv):
     model_size = 0
     for param in net_model.parameters():
         model_size += param.data.nelement()
-    print("Model params: %.2f M" % (model_size / 1024 / 1024))
+    print(f"[dim={FLAGS.latent_dim}] Model params: {model_size / 1024 / 1024:.2f} M", flush=True)
 
     #################################
     #            OT-CFM
@@ -394,7 +381,7 @@ def train(rank, total_num_gpus, argv):
 
     with trange(num_epochs, dynamic_ncols=True) as epoch_pbar:
         for epoch in epoch_pbar:
-            epoch_pbar.set_description(f"Epoch {epoch + 1}/{num_epochs}")
+            epoch_pbar.set_description(f"[dim={FLAGS.latent_dim}] Epoch {epoch + 1}/{num_epochs}")
             if sampler is not None:
                 sampler.set_epoch(epoch)
 
@@ -425,12 +412,16 @@ def train(rank, total_num_gpus, argv):
                     step_pbar.set_postfix(loss=f"{loss_value:.4f}", best_loss=f"{best_loss:.4f}")
                     if global_step % FLAGS.log_every_steps == 0 or global_step == 1:
                         print(
-                            f"[step {global_step}] loss={loss_value:.6f} best_loss={best_loss:.6f}",
+                            f"[dim={FLAGS.latent_dim}] [step {global_step}] loss={loss_value:.6f} best_loss={best_loss:.6f}",
                             flush=True,
                         )
 
                     # sample and Saving the weights
                     if (FLAGS.save_step > 0 and global_step % FLAGS.save_step == 0) or global_step == 1:
+                        print(
+                            f"[dim={FLAGS.latent_dim}] [step {global_step}] saving checkpoint + generating sample trajectories",
+                            flush=True,
+                        )
                         generate_sample_trajectories(
                             net_model, FLAGS.parallel, savedir, global_step, net_="normal", train_sample=x1[:10], ae=ae
                         )
@@ -450,28 +441,61 @@ def train(rank, total_num_gpus, argv):
 
             epoch_avg_loss = epoch_loss_sum / steps_per_epoch
             print(
-                f"[epoch {epoch + 1}/{num_epochs}] step={global_step} "
+                f"[dim={FLAGS.latent_dim}] [epoch {epoch + 1}/{num_epochs}] step={global_step} "
                 f"avg_loss={epoch_avg_loss:.6f} best_loss={best_loss:.6f}",
                 flush=True,
             )
 
-            if FLAGS.eval_fid and (epoch + 1) % FLAGS.fid_every_epochs == 0:
-                fid_score = compute_train_fid(
-                    ema_model,
-                    ae,
-                    fid_datalooper,
-                    FLAGS.parallel,
-                    num_gen=FLAGS.fid_num_gen,
-                    batch_size=FLAGS.fid_batch_size,
-                    integration_steps=FLAGS.fid_integration_steps,
-                )
-                if fid_score < best_fid:
-                    best_fid = fid_score
+            if (epoch + 1) % FLAGS.fid_every_epochs == 0:
+                if FLAGS.eval_fid:
+                    fid_score = compute_train_fid(
+                        ema_model,
+                        ae,
+                        fid_datalooper,
+                        FLAGS.parallel,
+                        num_gen=FLAGS.fid_num_gen,
+                        batch_size=FLAGS.fid_batch_size,
+                        integration_steps=FLAGS.fid_integration_steps,
+                    )
+                    if fid_score < best_fid:
+                        best_fid = fid_score
+                    print(
+                        f"[dim={FLAGS.latent_dim}] [epoch {epoch + 1}/{num_epochs}] step={global_step} "
+                        f"FID({FLAGS.fid_num_gen})={fid_score:.4f} best_FID={best_fid:.4f}",
+                        flush=True,
+                    )
+
                 print(
-                    f"[epoch {epoch + 1}/{num_epochs}] step={global_step} "
-                    f"FID({FLAGS.fid_num_gen})={fid_score:.4f} best_FID={best_fid:.4f}",
+                    f"[dim={FLAGS.latent_dim}] [epoch {epoch + 1}/{num_epochs}] saving periodic checkpoint",
                     flush=True,
                 )
+                torch.save(
+                    {
+                        "net_model": net_model.state_dict(),
+                        "ema_model": ema_model.state_dict(),
+                        "sched": sched.state_dict(),
+                        "optim": optim.state_dict(),
+                        "step": global_step,
+                        "epoch": epoch + 1,
+                        "best_loss": best_loss,
+                        "best_fid": best_fid,
+                    },
+                    savedir + f"Cifar10_weights_epoch_{epoch + 1}_latent{FLAGS.latent_dim}_Lcfm.pt",
+                )
+
+            torch.save(
+                {
+                    "net_model": net_model.state_dict(),
+                    "ema_model": ema_model.state_dict(),
+                    "sched": sched.state_dict(),
+                    "optim": optim.state_dict(),
+                    "step": global_step,
+                    "epoch": epoch + 1,
+                    "best_loss": best_loss,
+                    "best_fid": best_fid,
+                },
+                savedir + f"latest_latent{FLAGS.latent_dim}_Lcfm.pt",
+            )
 
 
 
