@@ -62,7 +62,7 @@ flags.DEFINE_float("grad_clip", 1.0, help="gradient norm clipping")
 flags.DEFINE_integer(
     "total_steps", 400001, help="total training steps"
 )  # Lipman et al uses 400k but double batch size
-flags.DEFINE_integer("max_epochs", 800, help="hard cap on number of epochs, regardless of total_steps")
+flags.DEFINE_integer("max_epochs", 1000, help="hard cap on number of epochs, regardless of total_steps")
 flags.DEFINE_integer("warmup", 5000, help="learning rate warmup")
 flags.DEFINE_integer("batch_size", 128, help="batch size")  # Lipman et al uses 128
 flags.DEFINE_integer("num_workers", 4, help="workers of Dataloader")
