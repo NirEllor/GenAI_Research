@@ -7,6 +7,7 @@ sys.path.append('./code/cifar10/')
 import copy
 import math
 import os
+from collections import OrderedDict
 
 import torch
 from absl import app, flags
@@ -198,6 +199,73 @@ def compute_train_fid(model, ae, fid_datalooper, parallel, num_gen, batch_size, 
     return score
 
 
+def _strip_ddp_prefix(state_dict):
+    """Strip a DistributedDataParallel 'module.' prefix from checkpoint keys."""
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        new_state_dict[k[7:]] = v
+    return new_state_dict
+
+
+def _load_module_state(module, state_dict, module_name, ckpt_path, latent_dim):
+    try:
+        module.load_state_dict(state_dict)
+    except RuntimeError:
+        try:
+            module.load_state_dict(_strip_ddp_prefix(state_dict))
+        except RuntimeError as e2:
+            raise RuntimeError(
+                f"[dim={latent_dim}] Failed to load '{module_name}' state dict from "
+                f"checkpoint '{ckpt_path}' into a model built with latent_dim={latent_dim}. "
+                f"This usually means the checkpoint was trained with a different "
+                f"architecture or --latent_dim. Original error: {e2}"
+            ) from e2
+
+
+def load_checkpoint_state(path, net_model, ema_model, optim, sched, device, latent_dim, steps_per_epoch):
+    """Load training state from a checkpoint file into net_model/ema_model/optim/sched
+    (in place) and return (global_step, start_epoch, best_loss, best_fid). Tolerant of
+    older checkpoints missing 'epoch'/'best_loss'/'best_fid'/'latent_dim'.
+    """
+    checkpoint = torch.load(path, map_location=device)
+
+    ckpt_latent_dim = checkpoint.get("latent_dim")
+    if ckpt_latent_dim is not None and ckpt_latent_dim != latent_dim:
+        raise RuntimeError(
+            f"Checkpoint '{path}' was saved with latent_dim={ckpt_latent_dim}, "
+            f"but the current run uses --latent_dim={latent_dim}."
+        )
+
+    _load_module_state(net_model, checkpoint["net_model"], "net_model", path, latent_dim)
+    _load_module_state(ema_model, checkpoint["ema_model"], "ema_model", path, latent_dim)
+    optim.load_state_dict(checkpoint["optim"])
+    sched.load_state_dict(checkpoint["sched"])
+
+    global_step = checkpoint["step"]
+    start_epoch = checkpoint.get("epoch")
+    if start_epoch is None:
+        start_epoch = global_step // steps_per_epoch
+    best_loss = checkpoint.get("best_loss", float("inf"))
+    best_fid = checkpoint.get("best_fid", float("inf"))
+
+    return global_step, start_epoch, best_loss, best_fid
+
+
+def build_checkpoint_dict(net_model, ema_model, optim, sched, global_step, epoch, best_loss, best_fid, latent_dim):
+    """Assemble the standard checkpoint dict shared by all save sites."""
+    return {
+        "net_model": net_model.state_dict(),
+        "ema_model": ema_model.state_dict(),
+        "sched": sched.state_dict(),
+        "optim": optim.state_dict(),
+        "step": global_step,
+        "epoch": epoch,
+        "best_loss": best_loss,
+        "best_fid": best_fid,
+        "latent_dim": latent_dim,
+    }
+
+
 def train(rank, total_num_gpus, argv):
     device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() and rank != "cpu" else "cpu")
     print(
@@ -277,9 +345,11 @@ def train(rank, total_num_gpus, argv):
     os.makedirs(savedir, exist_ok=True)
 
     latest_ckpt_path = savedir + f"latest_latent{FLAGS.latent_dim}_Lcfm.pt"
-    if FLAGS.restart_dir is None and os.path.exists(latest_ckpt_path):
-        latest_ckpt = torch.load(latest_ckpt_path, map_location="cpu")
-        completed_epoch = latest_ckpt.get("epoch", 0)
+    resume_ckpt_path = FLAGS.restart_dir
+    auto_resumed = False
+    if resume_ckpt_path is None and os.path.exists(latest_ckpt_path):
+        latest_ckpt_meta = torch.load(latest_ckpt_path, map_location="cpu")
+        completed_epoch = latest_ckpt_meta.get("epoch", 0)
         if completed_epoch >= num_epochs:
             print(
                 f"[dim={FLAGS.latent_dim}] found completed checkpoint at {latest_ckpt_path} "
@@ -287,6 +357,8 @@ def train(rank, total_num_gpus, argv):
                 flush=True,
             )
             return
+        resume_ckpt_path = latest_ckpt_path
+        auto_resumed = True
 
     # MODELS
     net_model = UNetModelWrapper(
@@ -329,29 +401,23 @@ def train(rank, total_num_gpus, argv):
     optim = torch.optim.Adam(net_model.parameters(), lr=FLAGS.lr)
     sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
 
-    if FLAGS.restart_dir is not None:
-        checkpoint = torch.load(FLAGS.restart_dir, map_location=device)
-        try:
-            net_model.load_state_dict(checkpoint["net_model"])
-        except RuntimeError:
-            from collections import OrderedDict
-
-            new_state_dict = OrderedDict()
-            for k, v in checkpoint["net_model"].items():
-                new_state_dict[k[7:]] = v
-            net_model.load_state_dict(new_state_dict)
-        try:
-            ema_model.load_state_dict(checkpoint["ema_model"])
-        except RuntimeError:
-            from collections import OrderedDict
-
-            new_state_dict = OrderedDict()
-            for k, v in checkpoint["ema_model"].items():
-                new_state_dict[k[7:]] = v
-            ema_model.load_state_dict(new_state_dict)
-        optim.load_state_dict(checkpoint["optim"])
-        sched.load_state_dict(checkpoint["sched"])
-        global_step = checkpoint["step"]
+    if resume_ckpt_path is not None:
+        global_step, start_epoch, best_loss, best_fid = load_checkpoint_state(
+            resume_ckpt_path, net_model, ema_model, optim, sched, device,
+            FLAGS.latent_dim, steps_per_epoch,
+        )
+        resume_kind = "auto-detected latest checkpoint" if auto_resumed else "--restart_dir"
+        print(
+            f"[dim={FLAGS.latent_dim}] Resuming from {resume_ckpt_path} ({resume_kind}): "
+            f"epoch={start_epoch}, step={global_step}, "
+            f"best_loss={best_loss:.6f}, best_fid={best_fid:.4f}",
+            flush=True,
+        )
+    else:
+        global_step = 0
+        start_epoch = 0
+        best_loss = float("inf")
+        best_fid = float("inf")
 
     if FLAGS.parallel:
         net_model = DistributedDataParallel(net_model, device_ids=[rank])
@@ -381,17 +447,7 @@ def train(rank, total_num_gpus, argv):
             f"Unknown model {FLAGS.model}, must be one of ['otcfm', 'icfm', 'fm', 'si']"
         )
 
-    if FLAGS.restart_dir is not None:
-        #global_step = 100000  # Chnage this according to the last run
-        num_epochs_run = math.ceil(global_step / steps_per_epoch)
-        num_epochs = num_epochs - num_epochs_run
-    else:
-        global_step = 0
-
-    best_loss = float("inf")
-    best_fid = float("inf")
-
-    with trange(num_epochs, dynamic_ncols=True) as epoch_pbar:
+    with trange(start_epoch, num_epochs, dynamic_ncols=True) as epoch_pbar:
         for epoch in epoch_pbar:
             epoch_pbar.set_description(f"[dim={FLAGS.latent_dim}] Epoch {epoch + 1}/{num_epochs}")
             if sampler is not None:
@@ -441,13 +497,10 @@ def train(rank, total_num_gpus, argv):
                             ema_model, FLAGS.parallel, savedir, global_step, net_="ema", train_sample=x1[:10], ae=ae
                         )
                         torch.save(
-                            {
-                                "net_model": net_model.state_dict(),
-                                "ema_model": ema_model.state_dict(),
-                                "sched": sched.state_dict(),
-                                "optim": optim.state_dict(),
-                                "step": global_step,
-                            },
+                            build_checkpoint_dict(
+                                net_model, ema_model, optim, sched,
+                                global_step, epoch + 1, best_loss, best_fid, FLAGS.latent_dim,
+                            ),
                             savedir + f"Cifar10_weights_step_{global_step}_latent{FLAGS.latent_dim}_Lcfm.pt",
                         )
 
@@ -482,30 +535,18 @@ def train(rank, total_num_gpus, argv):
                     flush=True,
                 )
                 torch.save(
-                    {
-                        "net_model": net_model.state_dict(),
-                        "ema_model": ema_model.state_dict(),
-                        "sched": sched.state_dict(),
-                        "optim": optim.state_dict(),
-                        "step": global_step,
-                        "epoch": epoch + 1,
-                        "best_loss": best_loss,
-                        "best_fid": best_fid,
-                    },
+                    build_checkpoint_dict(
+                        net_model, ema_model, optim, sched,
+                        global_step, epoch + 1, best_loss, best_fid, FLAGS.latent_dim,
+                    ),
                     savedir + f"Cifar10_weights_epoch_{epoch + 1}_latent{FLAGS.latent_dim}_Lcfm.pt",
                 )
 
             torch.save(
-                {
-                    "net_model": net_model.state_dict(),
-                    "ema_model": ema_model.state_dict(),
-                    "sched": sched.state_dict(),
-                    "optim": optim.state_dict(),
-                    "step": global_step,
-                    "epoch": epoch + 1,
-                    "best_loss": best_loss,
-                    "best_fid": best_fid,
-                },
+                build_checkpoint_dict(
+                    net_model, ema_model, optim, sched,
+                    global_step, epoch + 1, best_loss, best_fid, FLAGS.latent_dim,
+                ),
                 savedir + f"latest_latent{FLAGS.latent_dim}_Lcfm.pt",
             )
 
