@@ -209,13 +209,16 @@ def build_ae(dim):
 
 
 def encode_conditioning_latent(net_model, ae, x1):
+    """Returns (ae_latent, teacher_y); see generate_teacher_datasets.py's
+    version of this function for what each represents. Used identically for
+    teacher and student evaluation so both receive equivalent conditioning."""
     with torch.no_grad():
         img = x1 / 2 + 0.5
-        latent = ae.encode(img)[0]
-        proj = net_model.latent_encodings(latent)
+        ae_latent = ae.encode(img)[0]
+        proj = net_model.latent_encodings(ae_latent)
         mu, logvar = proj.chunk(2, dim=1)
-        latent = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
-    return latent
+        teacher_y = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
+    return ae_latent, teacher_y
 
 
 def teacher_sample(net_model, latent, batch_size, integration_steps):
@@ -296,31 +299,41 @@ def generate(dim, size):
     ae = build_ae(dim)
     ensure_ae_recon(dim, ae)
 
+    # The teacher checkpoint is loaded even when evaluating a student: the
+    # only way to compute the AE-latent conditioning is via the teacher's own
+    # latent_encodings projection, and using the same protocol for both
+    # ensures the teacher and student receive equivalent conditioning.
+    teacher_ckpt_path = resolve_teacher_checkpoint_path(dim)
+    net_model = build_teacher(dim, teacher_ckpt_path)
+
     if is_teacher:
-        ckpt_path = resolve_teacher_checkpoint_path(dim)
-        print(f"[generate] dim={dim} model=teacher ckpt={ckpt_path.name} device={device}", flush=True)
-        net_model = build_teacher(dim, ckpt_path)
-        datalooper = make_datalooper(FLAGS.gen_batch_size)
+        print(f"[generate] dim={dim} model=teacher ckpt={teacher_ckpt_path.name} device={device}", flush=True)
     else:
         ckpt_path = base_dir(dim) / "students" / f"student_{dim}_{size}.pt"
         if not ckpt_path.exists():
             print(f"[generate] [ERROR] {ckpt_path} not found -- run train_students.py first.", flush=True)
             return
-        print(f"[generate] dim={dim} model=student n={size:,} ckpt={ckpt_path.name} device={device}", flush=True)
+        print(
+            f"[generate] dim={dim} model=student n={size:,} ckpt={ckpt_path.name} "
+            f"(latent conditioning via teacher ckpt={teacher_ckpt_path.name}) device={device}",
+            flush=True,
+        )
         student = load_student(str(ckpt_path), latent_dim=dim, device=str(device))
+
+    datalooper = make_datalooper(FLAGS.gen_batch_size)
 
     generated = 0
     with tqdm(total=FLAGS.n_samples, desc=f"  [dim={dim}] generating {label(size)}") as pbar:
         while generated < FLAGS.n_samples:
             batch_n = min(FLAGS.gen_batch_size, FLAGS.n_samples - generated)
+            real_img_batch = next(datalooper)[:batch_n].to(device)
+            ae_latent, teacher_y = encode_conditioning_latent(net_model, ae, real_img_batch)
             if is_teacher:
-                real_img_batch = next(datalooper)[:batch_n].to(device)
-                latent = encode_conditioning_latent(net_model, ae, real_img_batch)
-                imgs = teacher_sample(net_model, latent, batch_n, FLAGS.integration_steps)
+                imgs = teacher_sample(net_model, teacher_y, batch_n, FLAGS.integration_steps)
             else:
                 with torch.no_grad():
                     x0 = torch.randn(batch_n, 3, 32, 32, device=device)
-                    imgs = (x0 + student(x0)).clip(-1, 1)
+                    imgs = (x0 + student(x0, ae_latent)).clip(-1, 1)
             n = save_images_uint8(imgs, out_dir, generated)
             generated += n
             pbar.update(n)

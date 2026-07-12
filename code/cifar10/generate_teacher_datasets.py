@@ -167,15 +167,24 @@ def make_datalooper(batch_size):
 
 
 def encode_conditioning_latent(net_model, ae, x1):
-    """Reparameterized conditioning latent for a real CIFAR batch x1 in [-1,1]
-    (copied from compute_fid.py's gen_1_img)."""
+    """Returns (ae_latent, teacher_y) for a real CIFAR batch x1 in [-1,1]:
+    ae_latent -- the raw AE-encoded latent, shape (batch, dim). This is "the
+      AE latent" the teacher and student are both conditioned on, and what
+      gets persisted per sample below.
+    teacher_y -- net_model's own reparameterized projection of ae_latent
+      (shape (batch, unet_latent_dim); computation copied from
+      compute_fid.py's gen_1_img), held fixed across the Euler trajectory
+      that teacher sample is generated from -- net_model is in eval mode
+      here, so its forward() expects the reparameterization done once
+      up front rather than recomputed at every ODE step.
+    """
     with torch.no_grad():
         img = x1 / 2 + 0.5  # AE trained on [0,1] images
-        latent = ae.encode(img)[0]
-        proj = net_model.latent_encodings(latent)
+        ae_latent = ae.encode(img)[0]
+        proj = net_model.latent_encodings(ae_latent)
         mu, logvar = proj.chunk(2, dim=1)
-        latent = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
-    return latent
+        teacher_y = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
+    return ae_latent, teacher_y
 
 
 def euler_trajectory(net_model, latent, batch_size, integration_steps):
@@ -221,15 +230,15 @@ def generate_image_dataset(dim, size, net_model, ae, datalooper, out_dir):
     while generated < size:
         batch_n = min(FLAGS.gen_batch_size, size - generated)
         real_img_batch = next(datalooper)[:batch_n].to(device)
-        latent = encode_conditioning_latent(net_model, ae, real_img_batch)
-        traj = euler_trajectory(net_model, latent, batch_n, FLAGS.integration_steps)
+        ae_latent, teacher_y = encode_conditioning_latent(net_model, ae, real_img_batch)
+        traj = euler_trajectory(net_model, teacher_y, batch_n, FLAGS.integration_steps)
         x0 = traj[0]
         x1 = traj[-1].clip(-1, 1)
         img_uint8 = (x1 * 127.5 + 128).clip(0, 255).to(torch.uint8).cpu().numpy()
 
         noise_out[generated:generated + batch_n] = x0.to(torch.float16).cpu().numpy()
         images_out[generated:generated + batch_n] = img_uint8
-        latents_out[generated:generated + batch_n] = latent.detach().cpu().numpy()
+        latents_out[generated:generated + batch_n] = ae_latent.detach().cpu().numpy()
         generated += batch_n
         print(f"  [dim={dim}] {tag}: {generated}/{size}", flush=True)
 
@@ -271,13 +280,13 @@ def generate_trajectory_dataset(dim, net_model, ae, datalooper, out_dir):
     while generated < FLAGS.traj_num_samples:
         batch_n = min(FLAGS.gen_batch_size, FLAGS.traj_num_samples - generated)
         x1 = next(datalooper)[:batch_n].to(device)
-        latent = encode_conditioning_latent(net_model, ae, x1)
-        traj = euler_trajectory(net_model, latent, batch_n, FLAGS.integration_steps)
+        ae_latent, teacher_y = encode_conditioning_latent(net_model, ae, x1)
+        traj = euler_trajectory(net_model, teacher_y, batch_n, FLAGS.integration_steps)
         # traj: (integration_steps+1, batch_n, 3, 32, 32) -> keep stride frames, unclipped
         frames = traj[frame_indices].transpose(0, 1).to(torch.float16).cpu().numpy()
 
         images_out[generated:generated + batch_n] = frames
-        latents_out[generated:generated + batch_n] = latent.detach().cpu().numpy()
+        latents_out[generated:generated + batch_n] = ae_latent.detach().cpu().numpy()
         generated += batch_n
         print(f"  [dim={dim}] {tag}: {generated}/{FLAGS.traj_num_samples}", flush=True)
 
@@ -302,6 +311,7 @@ def generate_trajectory_dataset(dim, net_model, ae, datalooper, out_dir):
 def write_manifest(dim, out_dir, ckpt_path):
     manifest = {
         "latent_dim": dim,
+        "latent_kind": "ae_encoder_output",
         "model": FLAGS.model,
         "teacher_checkpoint": str(ckpt_path),
         "ema": FLAGS.ema,

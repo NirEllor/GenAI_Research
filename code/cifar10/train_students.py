@@ -1,17 +1,19 @@
 # Train one-step "student" models that distill each Latent-CFM teacher
 # (code/cifar10/train_cifar10_ddp_vae_cond_ic.py, via the synthetic datasets
-# from generate_teacher_datasets.py) into a single forward pass.
+# from generate_teacher_datasets.py) into a single forward pass, conditioned
+# on the same AE latent the teacher receives.
 #
 # For each latent dim x dataset size (6 x 4 = 24 students by default):
-#   - Loads the independent (x0, x1) pairs generated for that dim/size
+#   - Loads the (x0, x1, latent) triples generated for that dim/size
 #     (x0 = starting image noise at t=0, x1 = the teacher's Euler-integrated
-#     final sample at t=1 -- this repo's convention, see
-#     train_cifar10_ddp_vae_cond_ic.py).
+#     final sample at t=1, latent = the AE latent that conditioned that
+#     generation -- this repo's convention, see
+#     train_cifar10_ddp_vae_cond_ic.py and generate_teacher_datasets.py).
 #   - Trains a StudentDenoiser (code/torchcfm/models/student_denoiser.py --
 #     small, time-independent residual conv net, no timestep embedding, no
-#     FiLM conditioning, no attention) to predict the single global velocity
-#     v = x1 - x0 evaluated at x0 (t fixed at 0): one-step distillation, so a
-#     trained student generates a sample as x1_pred = x0 + student(x0) in a
+#     attention) to predict the single global velocity v = x1 - x0 evaluated
+#     at (x0, latent), t fixed at 0: one-step distillation, so a trained
+#     student generates a sample as x1_pred = x0 + student(x0, latent) in a
 #     single forward pass -- no ODE integration needed at inference.
 #
 # Skips any student checkpoint that already exists -- safe to restart.
@@ -58,6 +60,7 @@ flags.DEFINE_list("dataset_sizes", ["50000", "100000", "150000", "200000"], "syn
 
 flags.DEFINE_integer("student_hidden_channels", 64, "student residual-block channel width")
 flags.DEFINE_integer("student_n_blocks", 4, "number of student residual blocks")
+flags.DEFINE_integer("latent_embed_dim", 256, "fixed internal latent conditioning width, constant across all latent dims")
 
 flags.DEFINE_integer("epochs", 500, "max training epochs")
 flags.DEFINE_integer("batch_size", 256, "batch size")
@@ -87,8 +90,10 @@ def get_device(dim=None):
     return torch.device("cuda")
 
 
-def build_student(device):
+def build_student(dim, device):
     return StudentDenoiser(
+        latent_input_dim=dim,
+        latent_embed_dim=FLAGS.latent_embed_dim,
         hidden_channels=FLAGS.student_hidden_channels,
         n_blocks=FLAGS.student_n_blocks,
     ).to(device)
@@ -108,20 +113,37 @@ def update_ema(ema, model, decay):
             ema_p.data.mul_(decay).add_(p.data, alpha=1.0 - decay)
 
 
-class NoiseSamplePairs(Dataset):
-    """(x0, x1) pairs from generate_teacher_datasets.py's per-size output:
-    x0 = noise_fp16_n{size}.npy (unclipped float16), x1 = images_uint8_n{size}.npy
-    (uint8, rescaled back to [-1,1] here)."""
+class NoiseLatentSamplePairs(Dataset):
+    """(x0, x1, latent) triples from generate_teacher_datasets.py's per-size
+    output: x0 = noise_fp16_n{size}.npy (unclipped float16),
+    x1 = images_uint8_n{size}.npy (uint8, rescaled back to [-1,1] here),
+    latent = latents_fp32_n{size}.npy (the AE latent that conditioned that
+    teacher generation)."""
 
-    def __init__(self, synthetic_dir, size, load_to_ram):
+    def __init__(self, synthetic_dir, size, latent_dim, load_to_ram):
         noise_path = synthetic_dir / f"noise_fp16_n{size}.npy"
         images_path = synthetic_dir / f"images_uint8_n{size}.npy"
+        latents_path = synthetic_dir / f"latents_fp32_n{size}.npy"
         mmap_mode = None if load_to_ram else "r"
         self.x0 = np.load(str(noise_path), mmap_mode=mmap_mode)
         self.x1 = np.load(str(images_path), mmap_mode=mmap_mode)
+        self.latent = np.load(str(latents_path), mmap_mode=mmap_mode)
         if load_to_ram:
             self.x0 = np.array(self.x0)
             self.x1 = np.array(self.x1)
+            self.latent = np.array(self.latent)
+
+        if self.latent.ndim != 2 or self.latent.shape[1] != latent_dim:
+            raise ValueError(
+                f"Latent shape mismatch in '{latents_path}': expected (N, {latent_dim}), "
+                f"got {tuple(self.latent.shape)}."
+            )
+        n = self.x0.shape[0]
+        if len(self.x1) != n or len(self.latent) != n:
+            raise ValueError(
+                f"Sample count mismatch under '{synthetic_dir}' (n={size}): "
+                f"x0 has {n}, x1 has {len(self.x1)}, latent has {len(self.latent)}."
+            )
 
     def __len__(self):
         return self.x0.shape[0]
@@ -130,7 +152,8 @@ class NoiseSamplePairs(Dataset):
         x0 = torch.from_numpy(np.array(self.x0[idx])).to(torch.float32)
         # Inverts generate_teacher_datasets.py's (x1 * 127.5 + 128).clip(0, 255).to(uint8) encoding.
         x1 = (torch.from_numpy(np.array(self.x1[idx])).to(torch.float32) - 128.0) / 127.5
-        return x0, x1
+        latent = torch.from_numpy(np.array(self.latent[idx])).to(torch.float32)
+        return x0, x1, latent
 
 
 def plot_loss(history, dim, n_samples, plots_dir):
@@ -160,7 +183,7 @@ def train_student(dim, n_samples, device, base_dir):
               f"-- run generate_teacher_datasets.py first.", flush=True)
         return
 
-    dataset = NoiseSamplePairs(synthetic_dir, n_samples, FLAGS.load_to_ram)
+    dataset = NoiseLatentSamplePairs(synthetic_dir, n_samples, dim, FLAGS.load_to_ram)
     loader = DataLoader(
         dataset,
         batch_size=FLAGS.batch_size,
@@ -170,12 +193,26 @@ def train_student(dim, n_samples, device, base_dir):
         drop_last=True,
     )
     steps_per_epoch = len(loader)
-    print(f"  Batch shape      : ({FLAGS.batch_size}, 3, 32, 32)", flush=True)
-    print(f"  Steps per epoch  : {steps_per_epoch:,}", flush=True)
 
-    student = build_student(device)
+    student = build_student(dim, device)
     ema_student = create_ema(student, device)
-    print(f"  Student params   : {param_count(student)}", flush=True)
+
+    print(f"  latent_dim        : {dim}", flush=True)
+    print(f"  dataset_size      : {n_samples}", flush=True)
+    print(f"  latent_embed_dim  : {FLAGS.latent_embed_dim}", flush=True)
+    print(f"  hidden_channels   : {FLAGS.student_hidden_channels}", flush=True)
+    print(f"  n_blocks          : {FLAGS.student_n_blocks}", flush=True)
+    print(f"  n_examples        : {len(dataset):,}", flush=True)
+    print(f"  student params    : {param_count(student)}", flush=True)
+    print(f"  conditioning      : ae_latent", flush=True)
+    print(f"  Steps per epoch   : {steps_per_epoch:,}", flush=True)
+
+    x0_chk, x1_chk, latent_chk = next(iter(loader))
+    print(
+        f"  Batch shape check : x0={tuple(x0_chk.shape)}  x1={tuple(x1_chk.shape)}  "
+        f"latent={tuple(latent_chk.shape)}",
+        flush=True,
+    )
 
     optimizer = AdamW(student.parameters(), lr=FLAGS.lr, weight_decay=FLAGS.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=FLAGS.epochs, eta_min=FLAGS.lr * 0.01)
@@ -190,12 +227,13 @@ def train_student(dim, n_samples, device, base_dir):
         student.train()
         total_loss = 0.0
 
-        for batch_idx, (x0, x1) in enumerate(loader):
+        for batch_idx, (x0, x1, latent) in enumerate(loader):
             x0 = x0.to(device)
             x1 = x1.to(device)
+            latent = latent.to(device)
 
             v_target = x1 - x0
-            v_pred = student(x0)
+            v_pred = student(x0, latent)
             loss = F.mse_loss(v_pred, v_target)
 
             optimizer.zero_grad()
@@ -241,9 +279,12 @@ def train_student(dim, n_samples, device, base_dir):
         {
             "model_state_dict": ema_student.state_dict(),
             "latent_dim": dim,
+            "latent_embed_dim": FLAGS.latent_embed_dim,
+            "dataset_size": n_samples,
             "n_samples": n_samples,
             "student_hidden_channels": FLAGS.student_hidden_channels,
             "student_n_blocks": FLAGS.student_n_blocks,
+            "conditioning": "ae_latent",
             "loss_history": history,
             "best_loss": best_loss,
             "best_epoch": best_epoch,
