@@ -2,7 +2,9 @@
 # (code/cifar10/train_cifar10_ddp_vae_cond_ic.py), for later distillation into
 # smaller "student" models. For each AE latent dim, produces:
 #   - one independent synthetic image dataset per --dataset_sizes entry
-#     (final Euler-integrated samples + the conditioning latent used per sample)
+#     (starting noise x0, final Euler-integrated sample x1, and the
+#     conditioning latent used per sample -- (x0, x1) pairs are what
+#     train_students.py distills a one-step student on)
 #   - one trajectory dataset (a small set of samples with several intermediate
 #     Euler states each, for future students trained on "middle-time" targets)
 #
@@ -196,35 +198,49 @@ def _mark_done(out_dir, tag):
 
 
 def generate_image_dataset(dim, size, net_model, ae, datalooper, out_dir):
+    """Generate `size` independent (x0, x1) pairs: x0 is the starting image
+    noise (t=0, this repo's convention per train_cifar10_ddp_vae_cond_ic.py),
+    x1 is the teacher's Euler-integrated final sample (t=1). Also persists the
+    conditioning latent used per sample. x0 is saved unclipped/float16 (noise
+    is not bounded to [-1,1] the way the final sample is); x1 is saved uint8
+    (matches compute_fid.py's generated-image convention).
+    """
     tag = f"images_n{size}"
     if _is_done(out_dir, tag) and not FLAGS.overwrite:
         print(f"  [skip] {tag} already exists.", flush=True)
         return
 
+    noise_path = out_dir / f"noise_fp16_n{size}.npy.tmp"
     images_path = out_dir / f"images_uint8_n{size}.npy.tmp"
     latents_path = out_dir / f"latents_fp32_n{size}.npy.tmp"
+    noise_out = np.lib.format.open_memmap(str(noise_path), mode="w+", dtype=np.float16, shape=(size, 3, 32, 32))
     images_out = np.lib.format.open_memmap(str(images_path), mode="w+", dtype=np.uint8, shape=(size, 3, 32, 32))
     latents_out = np.lib.format.open_memmap(str(latents_path), mode="w+", dtype=np.float32, shape=(size, dim))
 
     generated = 0
     while generated < size:
         batch_n = min(FLAGS.gen_batch_size, size - generated)
-        x1 = next(datalooper)[:batch_n].to(device)
-        latent = encode_conditioning_latent(net_model, ae, x1)
+        real_img_batch = next(datalooper)[:batch_n].to(device)
+        latent = encode_conditioning_latent(net_model, ae, real_img_batch)
         traj = euler_trajectory(net_model, latent, batch_n, FLAGS.integration_steps)
-        final = traj[-1].clip(-1, 1)
-        img_uint8 = (final * 127.5 + 128).clip(0, 255).to(torch.uint8).cpu().numpy()
+        x0 = traj[0]
+        x1 = traj[-1].clip(-1, 1)
+        img_uint8 = (x1 * 127.5 + 128).clip(0, 255).to(torch.uint8).cpu().numpy()
 
+        noise_out[generated:generated + batch_n] = x0.to(torch.float16).cpu().numpy()
         images_out[generated:generated + batch_n] = img_uint8
         latents_out[generated:generated + batch_n] = latent.detach().cpu().numpy()
         generated += batch_n
         print(f"  [dim={dim}] {tag}: {generated}/{size}", flush=True)
 
+    noise_out.flush()
     images_out.flush()
     latents_out.flush()
-    del images_out, latents_out
+    del noise_out, images_out, latents_out
+    final_noise_path = out_dir / f"noise_fp16_n{size}.npy"
     final_images_path = out_dir / f"images_uint8_n{size}.npy"
     final_latents_path = out_dir / f"latents_fp32_n{size}.npy"
+    os.replace(noise_path, final_noise_path)
     os.replace(images_path, final_images_path)
     os.replace(latents_path, final_latents_path)
     _mark_done(out_dir, tag)
