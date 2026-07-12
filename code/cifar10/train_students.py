@@ -7,8 +7,9 @@
 #     (x0 = starting image noise at t=0, x1 = the teacher's Euler-integrated
 #     final sample at t=1 -- this repo's convention, see
 #     train_cifar10_ddp_vae_cond_ic.py).
-#   - Trains a student UNetModelWrapper (no latent conditioning, small
-#     channel/res-block count) to predict the single global velocity
+#   - Trains a StudentDenoiser (code/torchcfm/models/student_denoiser.py --
+#     small, time-independent residual conv net, no timestep embedding, no
+#     FiLM conditioning, no attention) to predict the single global velocity
 #     v = x1 - x0 evaluated at x0 (t fixed at 0): one-step distillation, so a
 #     trained student generates a sample as x1_pred = x0 + student(x0) in a
 #     single forward pass -- no ODE integration needed at inference.
@@ -23,7 +24,7 @@
 import sys
 
 sys.path.append("./code/cifar10/")
-sys.path.append("./code/torchcfm/models/unet/")
+sys.path.append("./code/torchcfm/models/")
 
 import os
 from copy import deepcopy
@@ -42,7 +43,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from unet_resnetVAE import UNetModelWrapper
+from student_denoiser import StudentDenoiser, param_count
 
 FLAGS = flags.FLAGS
 
@@ -55,8 +56,8 @@ flags.DEFINE_integer("size", None, "single dataset size to use (omit for all --d
 flags.DEFINE_list("latent_dims", ["64", "128", "256", "384", "512", "1024"], "AE latent dims to process")
 flags.DEFINE_list("dataset_sizes", ["50000", "100000", "150000", "200000"], "synthetic dataset sizes to distil on")
 
-flags.DEFINE_integer("student_num_channels", 64, "student UNet base channel count (teacher default is 128)")
-flags.DEFINE_integer("student_num_res_blocks", 1, "student UNet res blocks per level (teacher default is 2)")
+flags.DEFINE_integer("student_hidden_channels", 64, "student residual-block channel width")
+flags.DEFINE_integer("student_n_blocks", 4, "number of student residual blocks")
 
 flags.DEFINE_integer("epochs", 500, "max training epochs")
 flags.DEFINE_integer("batch_size", 256, "batch size")
@@ -86,24 +87,10 @@ def get_device(dim=None):
     return torch.device("cuda")
 
 
-def param_count(model):
-    n = sum(p.numel() for p in model.parameters())
-    if n >= 1e6:
-        return f"{n / 1e6:.2f} M"
-    return f"{n / 1e3:.2f} K"
-
-
 def build_student(device):
-    return UNetModelWrapper(
-        dim=(3, 32, 32),
-        num_res_blocks=FLAGS.student_num_res_blocks,
-        num_channels=FLAGS.student_num_channels,
-        channel_mult=[1, 2, 2, 2],
-        num_heads=4,
-        num_head_channels=64,
-        attention_resolutions="16",
-        dropout=0.0,
-        num_latents=None,
+    return StudentDenoiser(
+        hidden_channels=FLAGS.student_hidden_channels,
+        n_blocks=FLAGS.student_n_blocks,
     ).to(device)
 
 
@@ -207,9 +194,8 @@ def train_student(dim, n_samples, device, base_dir):
             x0 = x0.to(device)
             x1 = x1.to(device)
 
-            t = torch.zeros(x0.size(0), device=device)
             v_target = x1 - x0
-            v_pred = student(t, x0)
+            v_pred = student(x0)
             loss = F.mse_loss(v_pred, v_target)
 
             optimizer.zero_grad()
@@ -256,8 +242,8 @@ def train_student(dim, n_samples, device, base_dir):
             "model_state_dict": ema_student.state_dict(),
             "latent_dim": dim,
             "n_samples": n_samples,
-            "student_num_channels": FLAGS.student_num_channels,
-            "student_num_res_blocks": FLAGS.student_num_res_blocks,
+            "student_hidden_channels": FLAGS.student_hidden_channels,
+            "student_n_blocks": FLAGS.student_n_blocks,
             "loss_history": history,
             "best_loss": best_loss,
             "best_epoch": best_epoch,
