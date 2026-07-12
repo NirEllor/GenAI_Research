@@ -87,6 +87,37 @@ Same backbone as `unet.py`, plus:
   ```
 - Not imported by any driver script in this repo (all training scripts import from `unet_resnetVAE`, not `unet_resnetVAE2`). Keep this in mind before "fixing" it — it looks like a scratch variant for a specific 2D-latent experiment, not a maintained alternative; check with whoever is doing 2D-latent work before modifying or deleting it.
 
+## Teacher/student distillation pipeline
+
+A downstream pipeline built on top of the CIFAR-10 Latent-CFM teachers above, to study distilling each per-latent-dim teacher into a much cheaper one-step "student" generator. Four scripts, run in order:
+
+| Step | Script | Produces |
+|---|---|---|
+| 1 | `code/cifar10/train_cifar10_ae_ddp.py` + `code/cifar10/train_cifar10_ddp_vae_cond_ic.py` (the "teacher") | `checkpoints/ae_<dim>.pt`, then `{runs}/latent_<dim>/<model>/Cifar10_weights_*_Lcfm.pt` |
+| 2 | `code/cifar10/generate_teacher_datasets.py` | `{runs}/latent_<dim>/<model>/synthetic/` — per-dim synthetic image datasets |
+| 3 | `code/cifar10/train_students.py` | `{runs}/latent_<dim>/<model>/students/student_<dim>_<n>.pt` — 24 one-step students (6 dims × 4 dataset sizes) |
+| 4 | `code/cifar10/eval.py` | `{runs}/latent_<dim>/<model>/eval/`, `{runs}/eval_summary/<model>/` — FID/IS + the FID-vs-dim plot |
+
+All four steps share the same on-disk convention: `--input_dir` is a base directory (default `./code/cifar10/runs/`), and every script derives `{input_dir}/latent_{dim}/{model}/...` for that dim/model's own artifacts (matching the layout `slurm/run_train_fm.sh` already produces via `train_cifar10_ddp_vae_cond_ic.py --output_dir ./code/cifar10/runs/latent_${DIM}/`). Matching SLURM launchers: `slurm/run_train_fm.sh` (step 1, teacher), `slurm/run_generate_datasets.sh` (step 2), `slurm/run_eval.sh` (step 4). `train_students.py` has no SLURM launcher yet.
+
+### Step 2 — `generate_teacher_datasets.py`
+
+For each latent dim, loads that dim's teacher checkpoint + matching `checkpoints/ae_<dim>.pt`, and reuses the exact conditioning/sampling logic from `compute_fid.py`'s `gen_1_img` (real CIFAR batch → AE-encode → reparameterize through the UNet's own `latent_encodings` → Euler-integrate noise to image) to produce:
+- 4 independent `(x0, x1)` pairs datasets per dim, one per `--dataset_sizes` entry (`noise_fp16_n{size}.npy` = starting noise x0 at t=0, `images_uint8_n{size}.npy` = the teacher's final sample x1 at t=1, `latents_fp32_n{size}.npy` = the conditioning latent used per sample) — this repo's `x0`=noise/`x1`=data convention, per `train_cifar10_ddp_vae_cond_ic.py`, not the reversed convention some earlier drafts of this pipeline used.
+- 1 trajectory dataset per dim (`trajectory_images_fp16.npy`, a strided subset of intermediate Euler states, for possible future students trained on "middle-time" targets instead of only the two endpoints).
+
+Outputs are self-describing `.npy` files (`np.lib.format.open_memmap`), written atomically (`.tmp` + rename) with a `.done` marker per output so a crash mid-generation can't be mistaken for a complete dataset on rerun.
+
+### Step 3 — `train_students.py` / `StudentDenoiser`
+
+For each of the 24 (dim, dataset size) combinations, loads that combination's `(x0, x1)` pairs and trains a **`StudentDenoiser`** (`code/torchcfm/models/student_denoiser.py`) via one-step distillation: `v_target = x1 - x0`, `v_pred = student(x0)`, `loss = MSE(v_pred, v_target)` — no ODE integration, no timestep sampling, the student is always evaluated at the single fixed point `t=0`. At inference, a trained student generates a sample in one forward pass: `x1_pred = x0 + student(x0)`.
+
+`StudentDenoiser` is deliberately much simpler than the teacher UNet, precisely because it never needs to condition on `t` or a latent: `input_proj` (`Conv2d(3, hidden_channels, 3)`) → `n_blocks` residual blocks (`GroupNorm+GELU+Conv3x3` ×2, added residually) → `output_head` (`GroupNorm+GELU+Conv2d(hidden_channels, 3, 1)`) — no down/up-sampling, no attention, no timestep embedding, no FiLM conditioning. `forward(x, t=None)` accepts `t` only for call-site symmetry with the teacher's `forward(t, x, y)`; it's never used. `student_denoiser.py` also provides `param_count` and `load_student(ckpt_path, latent_dim, device)`, which reconstructs the architecture from the checkpoint's own stored `student_hidden_channels`/`student_n_blocks` and validates the checkpoint's `latent_dim` matches what was requested.
+
+### Step 4 — `eval.py`
+
+Three restartable phases (`--generate`, `--metrics`, `--plot`) evaluating both the teacher and every student. Unlike a from-scratch latent-space generative pipeline, there is **no intermediate latent to decode** for either model here — the teacher's Euler integration happens directly in image space, and the student's one-step forward pass outputs a full image directly — so `--generate` produces PNGs directly (no separate decode phase). `--generate` also computes a shared, dim-scoped AE reconstruction (`{input_dir}/latent_<dim>/ae_recon/`, real CIFAR-10 test images round-tripped through `ConvAutoencoder.encode`/`.decode`) used for an AE-FID upper-bound metric — generation quality is bounded by how well the AE reconstructs, since the teacher conditions on AE-encoded real-image latents. `--metrics` computes FID (via `cleanfid`, `mode="legacy_tensorflow"` — matching `compute_fid.py`'s convention, so numbers are comparable across the repo) and Inception Score (via the optional `torch_fidelity` package). `--plot` aggregates every dim/size's metrics JSON into `{input_dir}/eval_summary/<model>/metrics_all.json` and produces `fid_vs_size.png` and **`fid_vs_dim.png`** — the latter (FID vs. latent dim, one line per dataset size plus a teacher baseline) is the pipeline's headline figure.
+
 ## Other models (non-image, not part of the AE/UNet story)
 
 - `code/torchcfm/models/models.py`:
