@@ -1,10 +1,13 @@
 # Generate synthetic datasets from trained Latent-CFM teacher models
 # (code/cifar10/train_cifar10_ddp_vae_cond_ic.py), for later distillation into
 # smaller "student" models. For each AE latent dim, produces:
-#   - one independent synthetic image dataset per --dataset_sizes entry
-#     (starting noise x0, final Euler-integrated sample x1, and the
-#     conditioning latent used per sample -- (x0, x1) pairs are what
-#     train_students.py distills a one-step student on)
+#   - one synthetic image pool of --dataset_size samples (starting noise x0,
+#     final Euler-integrated sample x1, and the AE latent used per sample --
+#     (x0, x1, latent) triples are what train_students.py distills a one-step
+#     student on; train_students.py trains its --dataset_sizes experiments on
+#     prefixes of this single pool, not independently generated datasets, so
+#     that a bigger dataset-size experiment is a strict superset of a smaller
+#     one)
 #   - one trajectory dataset (a small set of samples with several intermediate
 #     Euler states each, for future students trained on "middle-time" targets)
 #
@@ -13,7 +16,7 @@
 #     --input_dir ./code/cifar10/runs/ --model icfm --latest True
 #
 #   python code/cifar10/generate_teacher_datasets.py \
-#     --latent_dims 256 --step 600000 --dataset_sizes 50000,100000
+#     --latent_dims 256 --step 600000 --dataset_size 200000
 
 import json
 import sys
@@ -52,7 +55,7 @@ flags.DEFINE_bool("ema", True, "use ema_model weights instead of net_model")
 flags.DEFINE_integer("num_channel", 128, "UNet base channel count (must match training)")
 flags.DEFINE_integer("unet_latent_dim", 256, "UNet's own internal latent bottleneck width (must match training)")
 
-flags.DEFINE_list("dataset_sizes", ["50000", "100000", "150000", "200000"], "sizes of independent image datasets to generate per dim")
+flags.DEFINE_integer("dataset_size", 200000, "size of the single synthetic pool generated per dim -- train_students.py trains on prefixes of this pool, so it must be >= the largest --dataset_sizes entry used there")
 flags.DEFINE_integer("gen_batch_size", 500, "batch size used for Euler sampling")
 flags.DEFINE_integer("integration_steps", 100, "Euler integration steps (fixed grid)")
 
@@ -206,22 +209,29 @@ def _mark_done(out_dir, tag):
     (out_dir / f"{tag}.done").touch()
 
 
-def generate_image_dataset(dim, size, net_model, ae, datalooper, out_dir):
-    """Generate `size` independent (x0, x1) pairs: x0 is the starting image
-    noise (t=0, this repo's convention per train_cifar10_ddp_vae_cond_ic.py),
-    x1 is the teacher's Euler-integrated final sample (t=1). Also persists the
-    conditioning latent used per sample. x0 is saved unclipped/float16 (noise
-    is not bounded to [-1,1] the way the final sample is); x1 is saved uint8
-    (matches compute_fid.py's generated-image convention).
+def generate_image_dataset(dim, net_model, ae, datalooper, out_dir):
+    """Generate a single pool of FLAGS.dataset_size independent (x0, x1)
+    pairs: x0 is the starting image noise (t=0, this repo's convention per
+    train_cifar10_ddp_vae_cond_ic.py), x1 is the teacher's Euler-integrated
+    final sample (t=1). Also persists the AE latent that conditioned each
+    sample. x0 is saved unclipped/float16 (noise is not bounded to [-1,1] the
+    way the final sample is); x1 is saved uint8 (matches compute_fid.py's
+    generated-image convention).
+
+    train_students.py trains its (dim, dataset_size) experiments on prefixes
+    `[0:n]` of this single pool rather than independently generated datasets
+    per size, so that increasing the dataset size only adds samples instead
+    of also resampling the ones already used by smaller experiments.
     """
-    tag = f"images_n{size}"
+    size = FLAGS.dataset_size
+    tag = "images"
     if _is_done(out_dir, tag) and not FLAGS.overwrite:
         print(f"  [skip] {tag} already exists.", flush=True)
         return
 
-    noise_path = out_dir / f"noise_fp16_n{size}.npy.tmp"
-    images_path = out_dir / f"images_uint8_n{size}.npy.tmp"
-    latents_path = out_dir / f"latents_fp32_n{size}.npy.tmp"
+    noise_path = out_dir / "noise_fp16.npy.tmp"
+    images_path = out_dir / "images_uint8.npy.tmp"
+    latents_path = out_dir / "latents_fp32.npy.tmp"
     noise_out = np.lib.format.open_memmap(str(noise_path), mode="w+", dtype=np.float16, shape=(size, 3, 32, 32))
     images_out = np.lib.format.open_memmap(str(images_path), mode="w+", dtype=np.uint8, shape=(size, 3, 32, 32))
     latents_out = np.lib.format.open_memmap(str(latents_path), mode="w+", dtype=np.float32, shape=(size, dim))
@@ -246,9 +256,9 @@ def generate_image_dataset(dim, size, net_model, ae, datalooper, out_dir):
     images_out.flush()
     latents_out.flush()
     del noise_out, images_out, latents_out
-    final_noise_path = out_dir / f"noise_fp16_n{size}.npy"
-    final_images_path = out_dir / f"images_uint8_n{size}.npy"
-    final_latents_path = out_dir / f"latents_fp32_n{size}.npy"
+    final_noise_path = out_dir / "noise_fp16.npy"
+    final_images_path = out_dir / "images_uint8.npy"
+    final_latents_path = out_dir / "latents_fp32.npy"
     os.replace(noise_path, final_noise_path)
     os.replace(images_path, final_images_path)
     os.replace(latents_path, final_latents_path)
@@ -318,7 +328,7 @@ def write_manifest(dim, out_dir, ckpt_path):
         "integration_steps": FLAGS.integration_steps,
         "gen_batch_size": FLAGS.gen_batch_size,
         "seed": FLAGS.seed,
-        "dataset_sizes": [int(s) for s in FLAGS.dataset_sizes],
+        "dataset_size": FLAGS.dataset_size,
         "traj_num_samples": FLAGS.traj_num_samples,
         "traj_frame_stride": FLAGS.traj_frame_stride,
     }
@@ -337,10 +347,8 @@ def generate_for_dim(dim):
 
     datalooper = make_datalooper(FLAGS.gen_batch_size)
 
-    for size in FLAGS.dataset_sizes:
-        size = int(size)
-        print(f"  Generating independent dataset  n={size:,} ...", flush=True)
-        generate_image_dataset(dim, size, net_model, ae, datalooper, out_dir)
+    print(f"  Generating synthetic pool  n={FLAGS.dataset_size:,} ...", flush=True)
+    generate_image_dataset(dim, net_model, ae, datalooper, out_dir)
 
     print(f"  Generating trajectory dataset  n={FLAGS.traj_num_samples:,}  steps={FLAGS.integration_steps} ...", flush=True)
     generate_trajectory_dataset(dim, net_model, ae, datalooper, out_dir)
