@@ -40,7 +40,6 @@ flags.DEFINE_float("tol", 1e-5, help="Integrator tolerance (absolute and relativ
 flags.DEFINE_integer("batch_size_fid", 1024, help="Batch size to compute FID")
 flags.DEFINE_bool('ema',True, help='Use EMA model')
 flags.DEFINE_integer("class_cond", 0, help="Residual type - 0: no class, 1: dispatcher, 2: clust_id")
-flags.DEFINE_integer("unet_latent_dim", 256, help="width of the UNet's own internal latent conditioning bottleneck")
 flags.DEFINE_integer("latent_dim", None, help="flat latent dimension of the AE, e.g. 64/128/256/384/512/1024 (required if class_cond=1)")
 flags.DEFINE_string("ae_checkpoint", None, help="path to an ae_<dim>.pt checkpoint (dict with 'latent_dim'/'state_dict' keys, required if class_cond=1)")
 
@@ -105,7 +104,7 @@ new_net = UNetModelWrapper(
         dropout=0.1,
         num_classes=None,
         num_latents=FLAGS.latent_dim if FLAGS.class_cond == 1 else None,
-        latent_dim=FLAGS.unet_latent_dim,
+        latent_dim=FLAGS.latent_dim,
         class_cond= False,
     ).to(device)
 

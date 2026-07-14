@@ -65,7 +65,6 @@ flags.DEFINE_integer("epoch", None, "load a teacher's Cifar10_weights_epoch_{epo
 flags.DEFINE_bool("latest", False, "load the teacher's latest_latent{dim}_Lcfm.pt (overrides --step/--epoch)")
 flags.DEFINE_bool("ema", True, "use the teacher's ema_model weights")
 flags.DEFINE_integer("num_channel", 128, "teacher UNet base channel count (must match training)")
-flags.DEFINE_integer("unet_latent_dim", 256, "teacher UNet's internal latent bottleneck width (must match training)")
 
 flags.DEFINE_integer("n_samples", 10_000, "number of images to generate for FID/IS (compute_fid.py's single-model default is 50k; this sweeps 30 models so defaults lower)")
 flags.DEFINE_integer("integration_steps", 200, "teacher Euler integration steps")
@@ -187,7 +186,7 @@ def build_teacher(dim, ckpt_path):
         attention_resolutions="16",
         dropout=0.1,
         num_latents=dim,
-        latent_dim=FLAGS.unet_latent_dim,
+        latent_dim=dim,
     ).to(device)
     checkpoint = torch.load(ckpt_path, map_location=device)
     state_dict = checkpoint["ema_model"] if FLAGS.ema else checkpoint["net_model"]

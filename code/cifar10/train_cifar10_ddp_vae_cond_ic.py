@@ -43,9 +43,6 @@ flags.DEFINE_string("model", "otcfm", help="flow matching model type")
 flags.DEFINE_string("output_dir", "./results/", help="output_directory")
 # UNet
 flags.DEFINE_integer("num_channel", 128, help="base channel of UNet")
-flags.DEFINE_integer(
-    "unet_latent_dim", 256, help="width of the UNet's own internal latent conditioning bottleneck"
-)
 
 # Deterministic AE (latent conditioning source)
 flags.DEFINE_integer(
@@ -371,7 +368,7 @@ def train(rank, total_num_gpus, argv):
         attention_resolutions="16",
         dropout=0.1,
         num_latents=FLAGS.latent_dim,
-        latent_dim=FLAGS.unet_latent_dim,
+        latent_dim=FLAGS.latent_dim,
     ).to(
         rank
     )  # new dropout + bs of 128

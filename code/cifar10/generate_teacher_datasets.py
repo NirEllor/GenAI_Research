@@ -53,7 +53,6 @@ flags.DEFINE_bool("latest", False, "load latest_latent{dim}_Lcfm.pt (overrides -
 flags.DEFINE_bool("ema", True, "use ema_model weights instead of net_model")
 
 flags.DEFINE_integer("num_channel", 128, "UNet base channel count (must match training)")
-flags.DEFINE_integer("unet_latent_dim", 256, "UNet's own internal latent bottleneck width (must match training)")
 
 flags.DEFINE_integer("dataset_size", 200000, "size of the single synthetic pool generated per dim -- train_students.py trains on prefixes of this pool, so it must be >= the largest --dataset_sizes entry used there")
 flags.DEFINE_integer("gen_batch_size", 500, "batch size used for Euler sampling")
@@ -124,7 +123,7 @@ def build_teacher(latent_dim, ckpt_path):
         attention_resolutions="16",
         dropout=0.1,
         num_latents=latent_dim,
-        latent_dim=FLAGS.unet_latent_dim,
+        latent_dim=latent_dim,
     ).to(device)
 
     checkpoint = torch.load(ckpt_path, map_location=device)
@@ -175,7 +174,7 @@ def encode_conditioning_latent(net_model, ae, x1):
       AE latent" the teacher and student are both conditioned on, and what
       gets persisted per sample below.
     teacher_y -- net_model's own reparameterized projection of ae_latent
-      (shape (batch, unet_latent_dim); computation copied from
+      (shape (batch, dim), matching the AE latent dimension); computation copied from
       compute_fid.py's gen_1_img), held fixed across the Euler trajectory
       that teacher sample is generated from -- net_model is in eval mode
       here, so its forward() expects the reparameterization done once
