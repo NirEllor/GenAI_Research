@@ -79,7 +79,7 @@ class torch_wrapper(torch.nn.Module):
             self.y = y
 
     def forward(self, t, x, *args, **kwargs):
-        return self.model(t, x, y=self.y)[0]
+        return self.model(t, x, y=self.y)
 
 
 def _load_state_dict_tolerant(module, state_dict):
@@ -100,11 +100,11 @@ def teacher_run_dir(latent_dim):
 def resolve_checkpoint_path(latent_dim):
     run_dir = teacher_run_dir(latent_dim)
     if FLAGS.latest:
-        path = run_dir / f"latest_latent{latent_dim}_Lcfm.pt"
+        path = run_dir / f"latest_latent{latent_dim}_Lcfm_det.pt"
     elif FLAGS.step is not None:
-        path = run_dir / f"Cifar10_weights_step_{FLAGS.step}_latent{latent_dim}_Lcfm.pt"
+        path = run_dir / f"Cifar10_weights_step_{FLAGS.step}_latent{latent_dim}_Lcfm_det.pt"
     elif FLAGS.epoch is not None:
-        path = run_dir / f"Cifar10_weights_epoch_{FLAGS.epoch}_latent{latent_dim}_Lcfm.pt"
+        path = run_dir / f"Cifar10_weights_epoch_{FLAGS.epoch}_latent{latent_dim}_Lcfm_det.pt"
     else:
         raise ValueError("One of --latest, --step, --epoch must be given to select a teacher checkpoint.")
     if not path.exists():
@@ -123,14 +123,21 @@ def build_teacher(latent_dim, ckpt_path):
         attention_resolutions="16",
         dropout=0.1,
         num_latents=latent_dim,
-        latent_dim=latent_dim,
     ).to(device)
 
     checkpoint = torch.load(ckpt_path, map_location=device)
+
+    ckpt_conditioning = checkpoint.get("conditioning")
+    if ckpt_conditioning != "deterministic_ae_latent":
+        raise RuntimeError(
+            f"Checkpoint '{ckpt_path}' has conditioning={ckpt_conditioning!r}, "
+            f"but this script requires conditioning='deterministic_ae_latent'. "
+            f"The checkpoint may be from the old variational-latent code path and cannot be loaded here."
+        )
+
     state_dict = checkpoint["ema_model"] if FLAGS.ema else checkpoint["net_model"]
     _load_state_dict_tolerant(net_model, state_dict)
     net_model.eval()
-    net_model.training = False
 
     ae_checkpoint_path = FLAGS.ae_checkpoint_template.format(dim=latent_dim)
     ae = ConvAutoencoder(latent_dim=latent_dim).to(device)
@@ -168,30 +175,17 @@ def make_datalooper(batch_size):
     return infiniteloop(dataloader)
 
 
-def encode_conditioning_latent(net_model, ae, x1):
-    """Returns (ae_latent, teacher_y) for a real CIFAR batch x1 in [-1,1]:
-    ae_latent -- the raw AE-encoded latent, shape (batch, dim). This is "the
-      AE latent" the teacher and student are both conditioned on, and what
-      gets persisted per sample below.
-    teacher_y -- net_model's own reparameterized projection of ae_latent
-      (shape (batch, dim), matching the AE latent dimension); computation copied from
-      compute_fid.py's gen_1_img), held fixed across the Euler trajectory
-      that teacher sample is generated from -- net_model is in eval mode
-      here, so its forward() expects the reparameterization done once
-      up front rather than recomputed at every ODE step.
-    """
+def encode_conditioning_latent(ae, x1):
+    """Returns the raw AE-encoded latent for a real CIFAR batch x1 in [-1,1]."""
     with torch.no_grad():
         img = x1 / 2 + 0.5  # AE trained on [0,1] images
-        ae_latent = ae.encode(img)[0]
-        proj = net_model.latent_encodings(ae_latent)
-        mu, logvar = proj.chunk(2, dim=1)
-        teacher_y = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
-    return ae_latent, teacher_y
+        latent = ae.encode(img)[0]
+    return latent
 
 
 def euler_trajectory(net_model, latent, batch_size, integration_steps):
     """Full Euler trajectory from image noise to a generated sample, shape
-    (integration_steps+1, batch_size, 3, 32, 32)."""
+    (integration_steps+1, batch_size, 3, 32, 32). latent is the raw AE-encoded latent."""
     node = NeuralODE(torch_wrapper(net_model, y=latent), solver="euler")
     t_span = torch.linspace(0, 1, integration_steps + 1, device=device)
     with torch.no_grad():
@@ -239,15 +233,15 @@ def generate_image_dataset(dim, net_model, ae, datalooper, out_dir):
     while generated < size:
         batch_n = min(FLAGS.gen_batch_size, size - generated)
         real_img_batch = next(datalooper)[:batch_n].to(device)
-        ae_latent, teacher_y = encode_conditioning_latent(net_model, ae, real_img_batch)
-        traj = euler_trajectory(net_model, teacher_y, batch_n, FLAGS.integration_steps)
+        latent = encode_conditioning_latent(ae, real_img_batch)
+        traj = euler_trajectory(net_model, latent, batch_n, FLAGS.integration_steps)
         x0 = traj[0]
         x1 = traj[-1].clip(-1, 1)
         img_uint8 = (x1 * 127.5 + 128).clip(0, 255).to(torch.uint8).cpu().numpy()
 
         noise_out[generated:generated + batch_n] = x0.to(torch.float16).cpu().numpy()
         images_out[generated:generated + batch_n] = img_uint8
-        latents_out[generated:generated + batch_n] = ae_latent.detach().cpu().numpy()
+        latents_out[generated:generated + batch_n] = latent.detach().cpu().numpy()
         generated += batch_n
         print(f"  [dim={dim}] {tag}: {generated}/{size}", flush=True)
 
@@ -289,13 +283,13 @@ def generate_trajectory_dataset(dim, net_model, ae, datalooper, out_dir):
     while generated < FLAGS.traj_num_samples:
         batch_n = min(FLAGS.gen_batch_size, FLAGS.traj_num_samples - generated)
         x1 = next(datalooper)[:batch_n].to(device)
-        ae_latent, teacher_y = encode_conditioning_latent(net_model, ae, x1)
-        traj = euler_trajectory(net_model, teacher_y, batch_n, FLAGS.integration_steps)
+        latent = encode_conditioning_latent(ae, x1)
+        traj = euler_trajectory(net_model, latent, batch_n, FLAGS.integration_steps)
         # traj: (integration_steps+1, batch_n, 3, 32, 32) -> keep stride frames, unclipped
         frames = traj[frame_indices].transpose(0, 1).to(torch.float16).cpu().numpy()
 
         images_out[generated:generated + batch_n] = frames
-        latents_out[generated:generated + batch_n] = ae_latent.detach().cpu().numpy()
+        latents_out[generated:generated + batch_n] = latent.detach().cpu().numpy()
         generated += batch_n
         print(f"  [dim={dim}] {tag}: {generated}/{FLAGS.traj_num_samples}", flush=True)
 
@@ -321,6 +315,7 @@ def write_manifest(dim, out_dir, ckpt_path):
     manifest = {
         "latent_dim": dim,
         "latent_kind": "ae_encoder_output",
+        "conditioning": "deterministic_ae_latent",
         "model": FLAGS.model,
         "teacher_checkpoint": str(ckpt_path),
         "ema": FLAGS.ema,

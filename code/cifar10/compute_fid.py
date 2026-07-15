@@ -64,8 +64,7 @@ class torch_wrapper(torch.nn.Module):
             self.y = y
 
     def forward(self, t, x, *args, **kwargs):
-        output = self.model(t,x,y=self.y) if hasattr(self, 'y') else self.model(t,x)
-        return output[0] if isinstance(output, tuple) else output
+        return self.model(t,x,y=self.y) if hasattr(self, 'y') else self.model(t,x)
 
 
 # DATASETS/DATALOADER
@@ -104,7 +103,6 @@ new_net = UNetModelWrapper(
         dropout=0.1,
         num_classes=None,
         num_latents=FLAGS.latent_dim if FLAGS.class_cond == 1 else None,
-        latent_dim=FLAGS.latent_dim,
         class_cond= False,
     ).to(device)
 
@@ -129,10 +127,19 @@ if FLAGS.class_cond == 1:
 if FLAGS.class_cond == 0:
     PATH = f"{FLAGS.input_dir}/{FLAGS.model}/Cifar10_weights_step_{FLAGS.step}.pt"
 elif FLAGS.class_cond == 1:
-    PATH = f"{FLAGS.input_dir}/{FLAGS.model}/Cifar10_weights_step_{FLAGS.step}_latent{FLAGS.latent_dim}_Lcfm.pt"
+    PATH = f"{FLAGS.input_dir}/{FLAGS.model}/Cifar10_weights_step_{FLAGS.step}_latent{FLAGS.latent_dim}_Lcfm_det.pt"
 
 print("path: ", PATH)
 checkpoint = torch.load(PATH, map_location=device)
+
+if FLAGS.class_cond == 1:
+    ckpt_conditioning = checkpoint.get("conditioning")
+    if ckpt_conditioning != "deterministic_ae_latent":
+        raise RuntimeError(
+            f"Checkpoint '{PATH}' has conditioning={ckpt_conditioning!r}, "
+            f"but this script requires conditioning='deterministic_ae_latent'. "
+            f"The checkpoint may be from the old variational-latent code path and cannot be loaded here."
+        )
 state_dict = checkpoint["ema_model"] if FLAGS.ema else checkpoint["net_model"]
 try:
     new_net.load_state_dict(state_dict)
@@ -162,12 +169,6 @@ def gen_1_img(unused_latent):
             output_tiled = np.asarray(output_tiled * 255, dtype=np.uint8)
             output_tiled = np.squeeze(output_tiled)
 
-
-            latent = new_net.latent_encodings(latent)
-            mu,logvar = torch.chunk(latent, 2, dim=1)
-            latent = mu + torch.randn_like(mu) * torch.exp(0.5*logvar) #torch.randn(FLAGS.batch_size_fid,256, device=device) #mu + torch.randn_like(mu) * torch.exp(0.5*logvar)    # Fixing the random latent conditioning for each trajectory
-            
-            # latent = torch.randn(FLAGS.batch_size_fid, 256, device=device)
             x = torch.randn(FLAGS.batch_size_fid, 3, 32, 32, device=device)
 
 

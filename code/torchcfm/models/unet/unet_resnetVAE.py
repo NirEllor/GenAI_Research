@@ -491,7 +491,6 @@ class UNetModel(nn.Module):
         num_classes=None,
         ## Addition
         num_latents=None,
-        latent_dim=256,
         use_checkpoint=False,
         use_fp16=False,
         num_heads=1,
@@ -538,38 +537,11 @@ class UNetModel(nn.Module):
 
         ## Addition
         if self.num_latents is not None:
-            # self.latent_mlp = nn.Sequential(
-            #     nn.Linear(self.num_latents, 256),
-            #     nn.SiLU(),
-            #     nn.Linear(256, 256)
-            # )
-            
-            # self.latent_mlp = nn.Linear(time_embed_dim, time_embed_dim)
-            self.latent_mlp = nn.Linear(latent_dim, time_embed_dim)
-
-            # Latent size: 200 x 8 x 8 --> 512 x 1 x 1
-            # self.latent_cnn = nn.Sequential(
-            #     Downsample(self.num_latents,True,dims=2,out_channels=time_embed_dim),
-            #     nn.SiLU(),
-            #     Downsample(time_embed_dim,True,dims=2,out_channels=time_embed_dim),
-            #     nn.SiLU(),
-            #     Downsample(time_embed_dim,True,dims=2,out_channels=time_embed_dim),
-            # )
-
-            self.latent_encodings = nn.Linear(self.num_latents, latent_dim*2)
-
-            # Latent size: 3 x 32 x 32 --> 512 x 1 x 1
-            # self.latent_cnn = nn.Sequential(
-            #     Downsample(self.num_latents,True,dims=2,out_channels=time_embed_dim),
-            #     nn.SiLU(),
-            #     Downsample(time_embed_dim,True,dims=2,out_channels=time_embed_dim),
-            #     nn.SiLU(),
-            #     Downsample(time_embed_dim,True,dims=2,out_channels=time_embed_dim),
-            #     nn.SiLU(),
-            #     Downsample(time_embed_dim,True,dims=2,out_channels=time_embed_dim),
-            #     nn.SiLU(),
-            #     Downsample(time_embed_dim,True,dims=2,out_channels=time_embed_dim),
-            # )
+            self.latent_mlp = nn.Sequential(
+                nn.Linear(self.num_latents, time_embed_dim),
+                nn.SiLU(),
+                nn.Linear(time_embed_dim, time_embed_dim),
+            )
 
 
         ch = input_ch = int(channel_mult[0] * model_channels)
@@ -747,24 +719,8 @@ class UNetModel(nn.Module):
 
         ## Addition
         if self.num_latents is not None:
-            if self.training:
-                # proj = self.latent_cnn(y).view(emb.shape[0],emb.shape[1]) #self.latent_mlp(y)
-                proj = self.latent_encodings(y)
-                mu,logvar = proj.chunk(2,dim=1)
-                proj = mu + th.randn_like(mu)*th.exp(logvar*0.5)
-                proj = self.latent_mlp(proj)
-                # proj = th.where(th.sum(th.abs(y),dim=-1,keepdim=True).repeat(1,proj.shape[-1]) > 1e-5, proj, th.zeros_like(proj))
-                # proj = proj + th.randn(emb.shape[0],emb.shape[1],device=x.device)*0.1
-                # print(proj.abs().sum(),flush=True)
-                emb = emb + proj #self.latent_mlp(y) if th.sum(th.abs(y)) > 1e-5 else emb
-                # proj = proj[:,:,None,None].repeat(1,1,4,4)
-                # h = h*0.1 + proj*0.9
-            else:
-                proj = y
-                mu,logvar = None,None
-                proj = self.latent_mlp(proj)
-                proj = th.where(th.sum(th.abs(y),dim=-1,keepdim=True).repeat(1,proj.shape[-1]) > 1e-5, proj, th.zeros_like(proj))
-                emb = emb + proj
+            proj = self.latent_mlp(y)
+            emb = emb + proj
 
         h = x.type(self.dtype)
         for module in self.input_blocks:
@@ -775,10 +731,7 @@ class UNetModel(nn.Module):
             h = th.cat([h, hs.pop()], dim=1)
             h = module(h, emb)
         h = h.type(x.dtype)
-        if self.num_latents is not None:
-            return self.out(h), mu,logvar  
-        else:
-            return self.out(h)
+        return self.out(h)
 
 
 class SuperResModel(UNetModel):
@@ -1015,7 +968,6 @@ class UNetModelWrapper(UNetModel):
         class_cond=False,
         num_classes=NUM_CLASSES,
         num_latents=None,
-        latent_dim=None,
         use_checkpoint=False,
         attention_resolutions="16",
         num_heads=1,
@@ -1062,7 +1014,6 @@ class UNetModelWrapper(UNetModel):
             channel_mult=channel_mult,
             num_classes=(num_classes if class_cond else None),
             num_latents=num_latents,
-            latent_dim=latent_dim,
             use_checkpoint=use_checkpoint,
             use_fp16=use_fp16,
             num_heads=num_heads,

@@ -147,7 +147,7 @@ class torch_wrapper(torch.nn.Module):
             self.y = y
 
     def forward(self, t, x, *args, **kwargs):
-        return self.model(t, x, y=self.y)[0]
+        return self.model(t, x, y=self.y)
 
 
 def _load_state_dict_tolerant(module, state_dict):
@@ -163,11 +163,11 @@ def _load_state_dict_tolerant(module, state_dict):
 def resolve_teacher_checkpoint_path(dim):
     run_dir = base_dir(dim)
     if FLAGS.latest:
-        path = run_dir / f"latest_latent{dim}_Lcfm.pt"
+        path = run_dir / f"latest_latent{dim}_Lcfm_det.pt"
     elif FLAGS.step is not None:
-        path = run_dir / f"Cifar10_weights_step_{FLAGS.step}_latent{dim}_Lcfm.pt"
+        path = run_dir / f"Cifar10_weights_step_{FLAGS.step}_latent{dim}_Lcfm_det.pt"
     elif FLAGS.epoch is not None:
-        path = run_dir / f"Cifar10_weights_epoch_{FLAGS.epoch}_latent{dim}_Lcfm.pt"
+        path = run_dir / f"Cifar10_weights_epoch_{FLAGS.epoch}_latent{dim}_Lcfm_det.pt"
     else:
         raise ValueError("One of --latest, --step, --epoch must be given to select a teacher checkpoint.")
     if not path.exists():
@@ -186,13 +186,20 @@ def build_teacher(dim, ckpt_path):
         attention_resolutions="16",
         dropout=0.1,
         num_latents=dim,
-        latent_dim=dim,
     ).to(device)
     checkpoint = torch.load(ckpt_path, map_location=device)
+
+    ckpt_conditioning = checkpoint.get("conditioning")
+    if ckpt_conditioning != "deterministic_ae_latent":
+        raise RuntimeError(
+            f"Checkpoint '{ckpt_path}' has conditioning={ckpt_conditioning!r}, "
+            f"but this script requires conditioning='deterministic_ae_latent'. "
+            f"The checkpoint may be from the old variational-latent code path and cannot be loaded here."
+        )
+
     state_dict = checkpoint["ema_model"] if FLAGS.ema else checkpoint["net_model"]
     _load_state_dict_tolerant(net_model, state_dict)
     net_model.eval()
-    net_model.training = False
     return net_model
 
 
@@ -207,24 +214,9 @@ def build_ae(dim):
     return ae
 
 
-def encode_conditioning_latent(net_model, ae, x1):
-    """Returns (ae_latent, teacher_y); see generate_teacher_datasets.py's
-    version of this function for what each represents. Used only for teacher
-    evaluation -- teacher_y (net_model's reparameterized projection) is what
-    drives the teacher's Euler integration."""
-    with torch.no_grad():
-        img = x1 / 2 + 0.5
-        ae_latent = ae.encode(img)[0]
-        proj = net_model.latent_encodings(ae_latent)
-        mu, logvar = proj.chunk(2, dim=1)
-        teacher_y = mu + torch.randn_like(mu) * torch.exp(0.5 * logvar)
-    return ae_latent, teacher_y
-
-
 def encode_ae_latent(ae, x1):
-    """Raw AE latent only, no teacher involved -- this is all the student
-    was trained on (see train_students.py), so student evaluation doesn't
-    need to load a teacher checkpoint or compute teacher_y."""
+    """Raw AE latent for both teacher and student evaluation. Teacher and student now
+    both consume the same deterministic AE latent."""
     with torch.no_grad():
         img = x1 / 2 + 0.5
         return ae.encode(img)[0]
@@ -328,13 +320,13 @@ def generate(dim, size):
             batch_n = min(FLAGS.gen_batch_size, FLAGS.n_samples - generated)
             real_img_batch = next(datalooper)[:batch_n].to(device)
             if is_teacher:
-                _, teacher_y = encode_conditioning_latent(net_model, ae, real_img_batch)
-                imgs = teacher_sample(net_model, teacher_y, batch_n, FLAGS.integration_steps)
+                latent = encode_ae_latent(ae, real_img_batch)
+                imgs = teacher_sample(net_model, latent, batch_n, FLAGS.integration_steps)
             else:
-                ae_latent = encode_ae_latent(ae, real_img_batch)
+                latent = encode_ae_latent(ae, real_img_batch)
                 with torch.no_grad():
                     x0 = torch.randn(batch_n, 3, 32, 32, device=device)
-                    imgs = (x0 + student(x0, ae_latent)).clip(-1, 1)
+                    imgs = (x0 + student(x0, latent)).clip(-1, 1)
             n = save_images_uint8(imgs, out_dir, generated)
             generated += n
             pbar.update(n)

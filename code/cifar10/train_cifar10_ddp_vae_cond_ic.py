@@ -106,7 +106,7 @@ class torch_wrapper(torch.nn.Module):
             self.y = y
 
     def forward(self, t, x, *args, **kwargs):
-        return self.model(t,x,y=self.y)[0]
+        return self.model(t,x,y=self.y)
 
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
@@ -131,7 +131,6 @@ def generate_sample_trajectories(model, parallel, savedir, step, net_="normal",t
     if parallel:
         # Send the models from GPU to CPU for inference with NeuralODE from Torchdyn
         model_ = model_.module.to(device)
-        model_.training = True
         x1 = train_sample.to(device)
         ae_ = ae_.to(device)
     else:
@@ -140,9 +139,6 @@ def generate_sample_trajectories(model, parallel, savedir, step, net_="normal",t
     traj_id = [j for j in range(0,100,10)]
     with torch.no_grad():
         latent = ae_.encode(x1 / 2 + 0.5)[0]  # AE trained on [0,1] images, x1 is [-1,1]
-        proj = model_.latent_encodings(latent)
-        mu, logvar = proj.chunk(2, dim=1)
-        latent = mu + torch.randn_like(mu) * torch.exp(logvar * 0.5)
         node_ = NeuralODE(torch_wrapper(model_,y=latent.to(device)), solver="euler", sensitivity="adjoint")
         traj = node_.trajectory(
                 torch.randn(10,3,32,32).to(device),
@@ -156,8 +152,6 @@ def generate_sample_trajectories(model, parallel, savedir, step, net_="normal",t
 
     model.train()
 
-def kl_loss(mu, logvar):
-    return -0.5 * (torch.sum(1 + logvar - mu.pow(2) - logvar.exp(),dim=1)).mean()
 
 
 def compute_train_fid(model, ae, fid_datalooper, parallel, num_gen, batch_size, integration_steps):
@@ -174,9 +168,6 @@ def compute_train_fid(model, ae, fid_datalooper, parallel, num_gen, batch_size, 
         with torch.no_grad():
             x1 = next(fid_datalooper).to(device)
             latent = ae.encode(x1 / 2 + 0.5)[0]  # AE trained on [0,1] images, x1 is [-1,1]
-            proj = model_.latent_encodings(latent)
-            mu, logvar = proj.chunk(2, dim=1)
-            latent = mu + torch.randn_like(mu) * torch.exp(logvar * 0.5)
             node_ = NeuralODE(torch_wrapper(model_, y=latent), solver="euler")
             t_span = torch.linspace(0, 1, integration_steps + 1, device=device)
             traj = node_.trajectory(torch.randn(x1.size(0), 3, 32, 32, device=device), t_span=t_span)
@@ -226,6 +217,15 @@ def load_checkpoint_state(path, net_model, ema_model, optim, sched, device, late
     """
     checkpoint = torch.load(path, map_location=device)
 
+    ckpt_conditioning = checkpoint.get("conditioning")
+    if ckpt_conditioning != "deterministic_ae_latent":
+        raise RuntimeError(
+            f"Checkpoint '{path}' has conditioning={ckpt_conditioning!r}, "
+            f"but this script requires conditioning='deterministic_ae_latent'. "
+            f"The checkpoint may be from the old variational-latent code path (before the refactor) "
+            f"and cannot be loaded here."
+        )
+
     ckpt_latent_dim = checkpoint.get("latent_dim")
     if ckpt_latent_dim is not None and ckpt_latent_dim != latent_dim:
         raise RuntimeError(
@@ -260,6 +260,7 @@ def build_checkpoint_dict(net_model, ema_model, optim, sched, global_step, epoch
         "best_loss": best_loss,
         "best_fid": best_fid,
         "latent_dim": latent_dim,
+        "conditioning": "deterministic_ae_latent",
     }
 
 
@@ -341,7 +342,7 @@ def train(rank, total_num_gpus, argv):
     savedir = FLAGS.output_dir + FLAGS.model + "/"
     os.makedirs(savedir, exist_ok=True)
 
-    latest_ckpt_path = savedir + f"latest_latent{FLAGS.latent_dim}_Lcfm.pt"
+    latest_ckpt_path = savedir + f"latest_latent{FLAGS.latent_dim}_Lcfm_det.pt"
     resume_ckpt_path = FLAGS.restart_dir
     auto_resumed = False
     if resume_ckpt_path is None and os.path.exists(latest_ckpt_path):
@@ -368,11 +369,10 @@ def train(rank, total_num_gpus, argv):
         attention_resolutions="16",
         dropout=0.1,
         num_latents=FLAGS.latent_dim,
-        latent_dim=FLAGS.latent_dim,
     ).to(
         rank
     )  # new dropout + bs of 128
-    net_model.training = True
+    net_model.train()
 
     ae = ConvAutoencoder(latent_dim=FLAGS.latent_dim).to(device)
     ae_checkpoint = torch.load(
@@ -462,8 +462,8 @@ def train(rank, total_num_gpus, argv):
 
                     x0 = torch.randn_like(x1)
                     t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1)
-                    vt,mu,logvar = net_model(t, xt,y=latent)
-                    loss = torch.mean((vt - ut) ** 2) + 0.001*kl_loss(mu, logvar)
+                    vt = net_model(t, xt, y=latent)
+                    loss = torch.mean((vt - ut) ** 2)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(net_model.parameters(), FLAGS.grad_clip)  # new
                     optim.step()
@@ -498,7 +498,7 @@ def train(rank, total_num_gpus, argv):
                                 net_model, ema_model, optim, sched,
                                 global_step, epoch + 1, best_loss, best_fid, FLAGS.latent_dim,
                             ),
-                            savedir + f"Cifar10_weights_step_{global_step}_latent{FLAGS.latent_dim}_Lcfm.pt",
+                            savedir + f"Cifar10_weights_step_{global_step}_latent{FLAGS.latent_dim}_Lcfm_det.pt",
                         )
 
             epoch_avg_loss = epoch_loss_sum / steps_per_epoch
@@ -536,7 +536,7 @@ def train(rank, total_num_gpus, argv):
                         net_model, ema_model, optim, sched,
                         global_step, epoch + 1, best_loss, best_fid, FLAGS.latent_dim,
                     ),
-                    savedir + f"Cifar10_weights_epoch_{epoch + 1}_latent{FLAGS.latent_dim}_Lcfm.pt",
+                    savedir + f"Cifar10_weights_epoch_{epoch + 1}_latent{FLAGS.latent_dim}_Lcfm_det.pt",
                 )
 
             torch.save(
@@ -544,7 +544,7 @@ def train(rank, total_num_gpus, argv):
                     net_model, ema_model, optim, sched,
                     global_step, epoch + 1, best_loss, best_fid, FLAGS.latent_dim,
                 ),
-                savedir + f"latest_latent{FLAGS.latent_dim}_Lcfm.pt",
+                savedir + f"latest_latent{FLAGS.latent_dim}_Lcfm_det.pt",
             )
 
 

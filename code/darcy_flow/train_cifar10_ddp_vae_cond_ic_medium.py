@@ -50,7 +50,6 @@ flags.DEFINE_string("model", "otcfm", help="flow matching model type")
 flags.DEFINE_string("output_dir", "./results/", help="output_directory")
 # UNet
 flags.DEFINE_integer("num_channel", 128, help="base channel of UNet")
-flags.DEFINE_integer("latent_dim", 256, help="dimension of the latent space")
 
 # Training
 flags.DEFINE_float("lr", 2e-4, help="target learning rate")  # TRY 2e-4
@@ -91,7 +90,7 @@ class torch_wrapper(torch.nn.Module):
             self.y = y
 
     def forward(self, t, x, *args, **kwargs):
-        return self.model(t,x,y=self.y)[0]
+        return self.model(t,x,y=self.y)
 
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
@@ -116,21 +115,17 @@ def generate_sample_trajectories(model, parallel, savedir, step, net_="normal",t
     if parallel:
         # Send the models from GPU to CPU for inference with NeuralODE from Torchdyn
         model_ = model_.module.to(device)
-        model_.training = False
         x1 = train_sample.to(device)
         vae_ = vae_.module.to(device)
     else:
         x1 = train_sample
-    
+
     traj_id = [j for j in range(0,91,10)]
     traj_id.append(99)
     traj_id.remove(0)
     with torch.no_grad():
         _,latent = vae_.encode(x1)
         latent = latent.view(x1.size(0),-1)
-        proj = model_.latent_encodings(latent)
-        mu,logvar = proj.chunk(2,dim=1)
-        latent = mu + torch.randn_like(mu)*torch.exp(logvar*0.5)
         node_ = NeuralODE(torch_wrapper(model_,y=latent.to(device)), solver="euler", sensitivity="adjoint")
         traj = node_.trajectory(
                 torch.randn(10,2,64,64).to(device),
@@ -145,8 +140,6 @@ def generate_sample_trajectories(model, parallel, savedir, step, net_="normal",t
 
     model.train()
 
-def kl_loss(mu, logvar):
-    return -0.5 * (torch.sum(1 + logvar - mu.pow(2) - logvar.exp(),dim=1)).mean()
 
 
 def train(rank, total_num_gpus, argv):
@@ -227,11 +220,10 @@ def train(rank, total_num_gpus, argv):
         attention_resolutions="16",
         dropout=0.1,
         num_latents=8*8*8,
-        latent_dim=FLAGS.latent_dim,
     ).to(
         rank
     )  # new dropout + bs of 128
-    net_model.training = True
+    net_model.train()
 
 
 
@@ -243,6 +235,15 @@ def train(rank, total_num_gpus, argv):
 
     if FLAGS.restart_dir is not None:
         checkpoint = torch.load(FLAGS.restart_dir, map_location=f"cuda:{rank}")
+
+        ckpt_conditioning = checkpoint.get("conditioning")
+        if ckpt_conditioning != "deterministic_ae_latent":
+            raise RuntimeError(
+                f"Checkpoint '{FLAGS.restart_dir}' has conditioning={ckpt_conditioning!r}, "
+                f"but this script requires conditioning='deterministic_ae_latent'. "
+                f"The checkpoint may be from the old variational-latent code path and cannot be loaded here."
+            )
+
         try:
             net_model.load_state_dict(checkpoint["net_model"])
         except RuntimeError:
@@ -325,10 +326,8 @@ def train(rank, total_num_gpus, argv):
                     
                     x0 = torch.randn_like(x1)
                     t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1)
-                    vt,mu,logvar = net_model(t, xt,y=latent)
-                    mse_loss = torch.mean((vt - ut) ** 2)
-                    kl = kl_loss(mu, logvar)
-                    loss = mse_loss + 0.001 * kl
+                    vt = net_model(t, xt, y=latent)
+                    loss = torch.mean((vt - ut) ** 2)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(net_model.parameters(), FLAGS.grad_clip)  # new
                     # torch.nn.utils.clip_grad_norm_(vae.parameters(), FLAGS.grad_clip)  # new
@@ -339,8 +338,6 @@ def train(rank, total_num_gpus, argv):
                     if rank == 0:
                         wandb.log({
                         "loss/total": loss.item(),
-                        "loss/mse": mse_loss.item(),
-                        "loss/kl": kl.item(),
                         "global_step": global_step
                         })
 
@@ -361,8 +358,9 @@ def train(rank, total_num_gpus, argv):
                                 "sched": sched.state_dict(),
                                 "optim": optim.state_dict(),
                                 "step": global_step,
+                                "conditioning": "deterministic_ae_latent",
                             },
-                            savedir + f"{FLAGS.model}_cifar10_kde_weights_step_{global_step}_LCFM_finetune.pt",
+                            savedir + f"{FLAGS.model}_cifar10_kde_weights_step_{global_step}_LCFM_finetune_det.pt",
                         )
 
 
@@ -395,7 +393,6 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$NUM_GPUS train_cifar10_ddp_va
   --save_step 10000 \
   --parallel True \
   --master_addr $MASTER_ADDR \
-  --master_port $MASTER_PORT \
-  --latent_dim 2 \
+  --master_port $MASTER_PORT
 
 '''
