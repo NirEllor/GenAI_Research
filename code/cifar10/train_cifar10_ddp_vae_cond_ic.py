@@ -182,6 +182,7 @@ def compute_train_fid(model, ae, fid_datalooper, parallel, num_gen, batch_size, 
         mode="legacy_tensorflow",
         num_gen=num_gen,
         batch_size=batch_size,
+        num_workers=0
     )
     model.train()
     return score
